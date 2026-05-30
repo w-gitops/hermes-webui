@@ -5246,7 +5246,7 @@ def _handle_tts_proxy(handler):
     base = os.environ.get("VOICE_TOOLS_OPENAI_BASE_URL",
                           "http://127.0.0.1:9004/v1").rstrip("/")
     payload = _j.dumps({"input": text, "model": "tts-1",
-                        "voice": "alloy", "response_format": "wav"}).encode()
+                        "voice": "alloy", "response_format": "mp3"}).encode()
     try:
         req = _ur.Request(f"{base}/audio/speech", data=payload,
                           headers={"Content-Type": "application/json"})
@@ -5256,7 +5256,7 @@ def _handle_tts_proxy(handler):
         logger.warning("tts_proxy_error: %s", exc)
         return j(handler, {"error": str(exc)}, status=502)
     handler.send_response(200)
-    handler.send_header("Content-Type", "audio/wav")
+    handler.send_header("Content-Type", "audio/mpeg")
     handler.send_header("Content-Length", str(len(audio)))
     handler.end_headers()
     handler.wfile.write(audio)
