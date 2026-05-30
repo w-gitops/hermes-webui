@@ -1577,6 +1577,9 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
       if(_freshSegment&&window._showThinking!==false) appendThinking(_liveThinkingText());
       if(String((parsed&&parsed.displayText)||'').trim()||assistantRow) ensureAssistantRow();
       _scheduleRender();
+      // TTS auto-read: feed the live visible text so it can start speaking complete
+      // sentences mid-generation instead of waiting for the whole turn (#499 follow-up).
+      try{ if(window._hermesAutoRead) window._hermesAutoRead.feed((parsed&&parsed.displayText)||''); }catch(_){}
     });
 
     source.addEventListener('interim_assistant',e=>{
@@ -1956,8 +1959,13 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
           syncTopbar();renderMessages({preserveScroll:true});
           if(shouldFollowOnDone&&typeof scrollToBottom==='function') scrollToBottom();
           loadDir('.');
-          // TTS auto-read: speak the last assistant response if enabled (#499)
-          if(typeof autoReadLastAssistant==='function') setTimeout(()=>autoReadLastAssistant(), 300);
+          // TTS auto-read (#499). Prefer the incremental stream that already began
+          // speaking mid-generation; finish() flushes the final sentence and returns
+          // true. It returns false for non-streaming models / voice mode / auto-read
+          // off, in which case fall back to the legacy whole-message read.
+          var _arHandled=false;
+          try{ _arHandled=!!(window._hermesAutoRead&&window._hermesAutoRead.finish()); }catch(_){}
+          if(!_arHandled && typeof autoReadLastAssistant==='function') setTimeout(()=>autoReadLastAssistant(), 300);
         }
         if(isActiveSession&&_pendingGoalContinuation&&typeof queueSessionMessage==='function'){
           const _goalNext=_pendingGoalContinuation;

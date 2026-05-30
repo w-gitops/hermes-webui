@@ -5235,7 +5235,7 @@ def handle_get(handler, parsed) -> bool:
 
 
 _HERMES_TTS_JS = r"""<script>(function(){
-  if (window._hermesTTSSpeak) return;
+  if (window._hermesTTSStream) return;
   var _native = window.speechSynthesis.speak.bind(window.speechSynthesis);
   var _nativeCancel = window.speechSynthesis.cancel.bind(window.speechSynthesis);
   var _AC = window.AudioContext || window.webkitAudioContext;
@@ -5245,9 +5245,8 @@ _HERMES_TTS_JS = r"""<script>(function(){
     if (_ctx && _ctx.state === "suspended") { try { _ctx.resume(); } catch(e){} }
     return _ctx;
   }
-  // Split into sentence-sized chunks (hard-split >180 chars at a comma) so each
-  // /api/tts request stays small. Chatterbox is ~70ms/char and serializes requests,
-  // so one big request for a whole turn blows past the server timeout.
+  // Sentence-sized chunks (hard-split >180 chars at a comma) so each /api/tts request
+  // stays small: Chatterbox is ~70ms/char and serializes, so big requests time out.
   function _chunks(text){
     text = (text || "").replace(/\s+/g, " ").trim();
     var sents = text.match(/[^.!?]+[.!?]*/g) || [text];
@@ -5262,71 +5261,121 @@ _HERMES_TTS_JS = r"""<script>(function(){
     }
     return out;
   }
-  // Producer/consumer streaming: synthesize chunks one at a time (never concurrent --
-  // Chatterbox serializes) but keep synthesizing AHEAD of playback to build a buffer,
-  // so large blocks play gap-free. AbortController cancels in-flight synth when a new
-  // utterance starts, preventing the stale-request pile-up that doubled latency.
-  window._hermesTTSSpeak = function(text, opts){
+  // Streaming engine: push() text anytime, end() when done. Synthesizes one request at
+  // a time (Chatterbox serializes) but keeps synthesizing AHEAD of playback to build a
+  // buffer -> gap-free. AbortController cancels in-flight synth on a new utterance.
+  window._hermesTTSStream = function(opts){
     opts = opts || {};
     if (_activeCancel) { try { _activeCancel(); } catch(e){} }
     var ctx = _audioCtx();
-    var chunks = _chunks(text);
-    if (!chunks.length || !ctx){ if(opts.onend) opts.onend(); return function(){}; }
-    var cancelled = false, played = false, curSrc = null;
+    var noop = function(){};
+    if (!ctx){ if(opts.onend) opts.onend(); return {push:noop,end:noop,cancel:noop}; }
+    var cancelled=false, played=false, curSrc=null, ended=false, synthing=false, errored=false;
     var ac = (typeof AbortController !== "undefined") ? new AbortController() : null;
-    var queue = [], waiter = null, prodDone = false, prodErr = null;
-    function _wake(){ if (waiter){ var w = waiter; waiter = null; w(); } }
+    var chunkQ=[], audioQ=[], waiter=null;
+    function _wake(){ if(waiter){ var w=waiter; waiter=null; w(); } }
     function _synth(t){
-      var init = {method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify({text:t})};
-      if (ac) init.signal = ac.signal;
-      return fetch("/api/tts", init)
+      var init={method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({text:t})};
+      if(ac) init.signal=ac.signal;
+      return fetch("/api/tts",init)
         .then(function(r){ if(!r.ok) throw new Error("TTS "+r.status); return r.arrayBuffer(); })
-        .then(function(buf){ return ctx.decodeAudioData(buf); });
+        .then(function(b){ return ctx.decodeAudioData(b); });
     }
-    function produce(idx){
-      if (cancelled) return;
-      if (idx >= chunks.length){ prodDone = true; _wake(); return; }
-      _synth(chunks[idx]).then(function(decoded){
-        if (cancelled) return;
-        queue.push(decoded); _wake();
-        produce(idx + 1);
+    function pump(){
+      if (cancelled || synthing) return;
+      if (!chunkQ.length){ if(ended) _wake(); return; }
+      synthing=true;
+      _synth(chunkQ.shift()).then(function(dec){
+        synthing=false; if(cancelled) return;
+        audioQ.push(dec); _wake(); pump();
       }).catch(function(e){
-        if (cancelled) return;
-        prodErr = e; prodDone = true; _wake();
+        synthing=false; if(cancelled) return;
+        errored=true; _wake(); pump();
       });
     }
     function consume(){
       if (cancelled) return;
-      if (queue.length){
-        var decoded = queue.shift();
-        var src = ctx.createBufferSource();
-        src.buffer = decoded; src.connect(ctx.destination); curSrc = src; played = true;
-        src.onended = function(){ consume(); };
-        try { src.start(); } catch(e){ consume(); }
+      if (audioQ.length){
+        var d=audioQ.shift(); var src=ctx.createBufferSource();
+        src.buffer=d; src.connect(ctx.destination); curSrc=src; played=true;
+        src.onended=function(){ consume(); };
+        try{ src.start(); }catch(e){ consume(); }
         return;
       }
-      if (prodDone){
-        if (prodErr && !played){ if(opts.onerror) opts.onerror(prodErr, played); else if(opts.onend) opts.onend(); }
+      if (ended && !chunkQ.length && !synthing){
+        if (errored && !played){ if(opts.onerror) opts.onerror(); else if(opts.onend) opts.onend(); }
         else if (opts.onend) opts.onend();
         return;
       }
-      waiter = consume;
+      waiter=consume;
     }
-    _activeCancel = function(){ cancelled = true; try{ if(ac) ac.abort(); }catch(e){} try{ if(curSrc) curSrc.stop(); }catch(e){} };
-    produce(0);
+    _activeCancel=function(){ cancelled=true; try{if(ac)ac.abort();}catch(e){} try{if(curSrc)curSrc.stop();}catch(e){} };
     consume();
-    return _activeCancel;
+    return {
+      push:function(text){ var cs=_chunks(text); for(var i=0;i<cs.length;i++) chunkQ.push(cs[i]); pump(); },
+      end:function(){ ended=true; pump(); _wake(); },
+      cancel:function(){ if(_activeCancel) _activeCancel(); }
+    };
   };
-  // Route browser speechSynthesis through Chatterbox (read-aloud button + others).
+  // One-shot: speak a complete string (read-aloud button, voice mode, fallback).
+  window._hermesTTSSpeak = function(text, opts){
+    var s = window._hermesTTSStream(opts||{});
+    s.push(text||""); s.end();
+    return s.cancel;
+  };
+  // Auto-read manager: fed the live cumulative visible text as the agent streams;
+  // speaks complete sentences as they settle so playback starts mid-generation.
+  window._hermesAutoRead = (function(){
+    var stream=null, spokenLen=0, lastFull="";
+    function enabled(){ try{ return localStorage.getItem("hermes-tts-auto-read")==="true"; }catch(e){ return false; } }
+    function blocked(){ return !!window._voiceModeActive; }
+    function _settled(full, isFinal){
+      var tail = full.slice(spokenLen);
+      var fences = (tail.match(/```/g)||[]).length;          // don't read inside an open code fence
+      if (fences % 2 === 1){ var lf = tail.lastIndexOf("```"); tail = (lf>0 ? tail.slice(0,lf) : ""); }
+      if (!isFinal){
+        var m = tail.match(/[\s\S]*[.!?\n]/);                 // only up to the last complete sentence/line
+        tail = m ? m[0] : "";
+      }
+      return tail;
+    }
+    function _emit(raw){
+      if (!raw) return;
+      spokenLen += raw.length;
+      var clean = (typeof window._stripForTTS==="function") ? window._stripForTTS(raw) : raw;
+      if (clean && clean.trim() && stream) stream.push(clean);
+    }
+    return {
+      feed: function(full){
+        full = full || "";
+        if (spokenLen > full.length){                         // shrank -> new/regenerated turn: reset
+          if (stream) stream.cancel();
+          stream=null; spokenLen=0; lastFull="";
+        }
+        lastFull = full;
+        if (!stream){
+          if (!enabled() || blocked()) return;
+          stream = window._hermesTTSStream({});
+        }
+        _emit(_settled(full, false));
+      },
+      finish: function(){
+        if (!stream) return false;                            // wasn't streaming -> let legacy read handle it
+        _emit(lastFull.slice(spokenLen));                     // flush the final partial sentence
+        stream.end();
+        stream=null; spokenLen=0; lastFull="";
+        return true;
+      }
+    };
+  })();
+  // Route browser speechSynthesis through Chatterbox; hook cancel for the stop button.
   window.speechSynthesis.speak = function(u){
     if (!u || !u.text) return _native(u);
     window._hermesTTSSpeak(u.text, {
       onend: function(){ if(u.onend) u.onend({}); },
-      onerror: function(e, played){ if(!played) _native(u); else if(u.onend) u.onend({}); }
+      onerror: function(){ _native(u); }
     });
   };
-  // Make the stop button actually stop Chatterbox playback (Web Audio, not the native
-  // speech queue, so speechSynthesis.cancel() alone would not halt it).
   window.speechSynthesis.cancel = function(){ if (_activeCancel){ try{ _activeCancel(); }catch(e){} } _nativeCancel(); };
 })();</script>"""
 
