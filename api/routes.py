@@ -5237,6 +5237,7 @@ def handle_get(handler, parsed) -> bool:
 _HERMES_TTS_JS = r"""<script>(function(){
   if (window._hermesTTSSpeak) return;
   var _native = window.speechSynthesis.speak.bind(window.speechSynthesis);
+  var _nativeCancel = window.speechSynthesis.cancel.bind(window.speechSynthesis);
   var _AC = window.AudioContext || window.webkitAudioContext;
   var _ctx = null, _activeCancel = null;
   function _audioCtx(){
@@ -5244,59 +5245,79 @@ _HERMES_TTS_JS = r"""<script>(function(){
     if (_ctx && _ctx.state === "suspended") { try { _ctx.resume(); } catch(e){} }
     return _ctx;
   }
-  // Split into sentence-sized chunks (hard-split >220 chars at a comma) so each
+  // Split into sentence-sized chunks (hard-split >180 chars at a comma) so each
   // /api/tts request stays small. Chatterbox is ~70ms/char and serializes requests,
-  // so one big request for a whole turn blows past the server timeout (-> 502 ->
-  // silent fallback). Small chunks => first audio in ~2s, no timeout.
+  // so one big request for a whole turn blows past the server timeout.
   function _chunks(text){
     text = (text || "").replace(/\s+/g, " ").trim();
     var sents = text.match(/[^.!?]+[.!?]*/g) || [text];
     var out = [];
     for (var i=0;i<sents.length;i++){
       var s = sents[i].trim(); if(!s) continue;
-      while (s.length > 220){
-        var cut = s.lastIndexOf(",", 220); if (cut < 80) cut = 220;
+      while (s.length > 180){
+        var cut = s.lastIndexOf(",", 180); if (cut < 60) cut = 180;
         out.push(s.slice(0, cut).trim()); s = s.slice(cut).trim();
       }
       if (s) out.push(s);
     }
     return out;
   }
-  function _synth(text, ctx){
-    return fetch("/api/tts", {method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify({text:text})})
-      .then(function(r){ if(!r.ok) throw new Error("TTS "+r.status); return r.arrayBuffer(); })
-      .then(function(buf){ return ctx.decodeAudioData(buf); });
-  }
-  // Speak text via Chatterbox: sequential playback, prefetching the next chunk only
-  // once the current one starts playing (keeps exactly one synth in flight, since
-  // Chatterbox serializes). opts: {onend, onerror}. Returns a cancel function.
+  // Producer/consumer streaming: synthesize chunks one at a time (never concurrent --
+  // Chatterbox serializes) but keep synthesizing AHEAD of playback to build a buffer,
+  // so large blocks play gap-free. AbortController cancels in-flight synth when a new
+  // utterance starts, preventing the stale-request pile-up that doubled latency.
   window._hermesTTSSpeak = function(text, opts){
     opts = opts || {};
     if (_activeCancel) { try { _activeCancel(); } catch(e){} }
-    var chunks = _chunks(text);
     var ctx = _audioCtx();
+    var chunks = _chunks(text);
     if (!chunks.length || !ctx){ if(opts.onend) opts.onend(); return function(){}; }
-    var cancelled = false, played = false, curSrc = null, i = 0;
-    var pending = _synth(chunks[0], ctx);
-    function fail(e){ if(cancelled) return; cancelled = true;
-      if (opts.onerror) opts.onerror(e, played); else if (opts.onend) opts.onend(); }
-    function playNext(){
+    var cancelled = false, played = false, curSrc = null;
+    var ac = (typeof AbortController !== "undefined") ? new AbortController() : null;
+    var queue = [], waiter = null, prodDone = false, prodErr = null;
+    function _wake(){ if (waiter){ var w = waiter; waiter = null; w(); } }
+    function _synth(t){
+      var init = {method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify({text:t})};
+      if (ac) init.signal = ac.signal;
+      return fetch("/api/tts", init)
+        .then(function(r){ if(!r.ok) throw new Error("TTS "+r.status); return r.arrayBuffer(); })
+        .then(function(buf){ return ctx.decodeAudioData(buf); });
+    }
+    function produce(idx){
       if (cancelled) return;
-      if (i >= chunks.length){ if(opts.onend) opts.onend(); return; }
-      pending.then(function(decoded){
+      if (idx >= chunks.length){ prodDone = true; _wake(); return; }
+      _synth(chunks[idx]).then(function(decoded){
         if (cancelled) return;
-        if (i+1 < chunks.length) pending = _synth(chunks[i+1], ctx);
+        queue.push(decoded); _wake();
+        produce(idx + 1);
+      }).catch(function(e){
+        if (cancelled) return;
+        prodErr = e; prodDone = true; _wake();
+      });
+    }
+    function consume(){
+      if (cancelled) return;
+      if (queue.length){
+        var decoded = queue.shift();
         var src = ctx.createBufferSource();
         src.buffer = decoded; src.connect(ctx.destination); curSrc = src; played = true;
-        src.onended = function(){ i++; playNext(); };
-        src.start();
-      }).catch(fail);
+        src.onended = function(){ consume(); };
+        try { src.start(); } catch(e){ consume(); }
+        return;
+      }
+      if (prodDone){
+        if (prodErr && !played){ if(opts.onerror) opts.onerror(prodErr, played); else if(opts.onend) opts.onend(); }
+        else if (opts.onend) opts.onend();
+        return;
+      }
+      waiter = consume;
     }
-    _activeCancel = function(){ cancelled = true; try{ if(curSrc) curSrc.stop(); }catch(e){} };
-    playNext();
+    _activeCancel = function(){ cancelled = true; try{ if(ac) ac.abort(); }catch(e){} try{ if(curSrc) curSrc.stop(); }catch(e){} };
+    produce(0);
+    consume();
     return _activeCancel;
   };
-  // Route browser speechSynthesis.speak (read-aloud button) through Chatterbox.
+  // Route browser speechSynthesis through Chatterbox (read-aloud button + others).
   window.speechSynthesis.speak = function(u){
     if (!u || !u.text) return _native(u);
     window._hermesTTSSpeak(u.text, {
@@ -5304,6 +5325,9 @@ _HERMES_TTS_JS = r"""<script>(function(){
       onerror: function(e, played){ if(!played) _native(u); else if(u.onend) u.onend({}); }
     });
   };
+  // Make the stop button actually stop Chatterbox playback (Web Audio, not the native
+  // speech queue, so speechSynthesis.cancel() alone would not halt it).
+  window.speechSynthesis.cancel = function(){ if (_activeCancel){ try{ _activeCancel(); }catch(e){} } _nativeCancel(); };
 })();</script>"""
 
 def _handle_tts_proxy(handler):

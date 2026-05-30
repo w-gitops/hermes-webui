@@ -4328,25 +4328,19 @@ function autoReadLastAssistant(){
   const clean=_stripForTTS(text);
   if(!clean) return;
 
-  // Chatterbox TTS via /api/tts server proxy
-  fetch('/api/tts',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({text:clean})})
-    .then(r=>{if(!r.ok)throw new Error('TTS '+r.status);return r.arrayBuffer();})
-    .then(buf=>{
-      const ctx=new AudioContext();
-      return ctx.decodeAudioData(buf).then(decoded=>{
-        const src=ctx.createBufferSource();
-        src.buffer=decoded;
-        src.connect(ctx.destination);
-        src.start();
-      });
-    })
-    .catch(()=>{
-      const utter=new SpeechSynthesisUtterance(clean);
-      const savedVoice=localStorage.getItem('hermes-tts-voice');
-      const voices=speechSynthesis.getVoices();
-      if(savedVoice&&voices.length){const match=voices.find(v=>v.name===savedVoice);if(match) utter.voice=match;}
-      speechSynthesis.speak(utter);
-    });
+  // Chatterbox TTS via the shared streaming helper (chunked; defined in _HERMES_TTS_JS).
+  // Auto-read previously sent the whole response as ONE /api/tts request, which blew
+  // past the server timeout on long turns (Chatterbox is ~70ms/char) -> the "struggling
+  // with large blocks" symptom. The helper splits into sentence-sized chunks and streams.
+  if(typeof window._hermesTTSSpeak==='function'){
+    window._hermesTTSSpeak(clean,{});
+  }else{
+    const utter=new SpeechSynthesisUtterance(clean);
+    const savedVoice=localStorage.getItem('hermes-tts-voice');
+    const voices=speechSynthesis.getVoices();
+    if(savedVoice&&voices.length){const match=voices.find(v=>v.name===savedVoice);if(match) utter.voice=match;}
+    speechSynthesis.speak(utter);
+  }
 }
 
 // ── Reconnect banner (B4/B5: reload resilience) ──
