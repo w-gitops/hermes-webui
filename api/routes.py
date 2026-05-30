@@ -5234,7 +5234,77 @@ def handle_get(handler, parsed) -> bool:
 
 
 
-_HERMES_TTS_JS = "<script>(function(){var _o=window.speechSynthesis.speak.bind(window.speechSynthesis);function _sp(t){var p=t.match(/[^.!?]+[.!?]*/g)||[t];return p.map(function(s){return s.trim();}).filter(Boolean);}function _fa(s){return fetch('/api/tts',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({text:s})}).then(function(r){if(!r.ok)throw r;return r.arrayBuffer();});}window.speechSynthesis.speak=function(u){if(!u||!u.text)return _o(u);var ss=_sp(u.text),ff=ss.map(_fa),ctx=new AudioContext();ctx.resume().then(function(){return ff.reduce(function(c,f){return c.then(function(){return f.then(function(b){return ctx.decodeAudioData(b).then(function(d){return new Promise(function(res,rej){var s=ctx.createBufferSource();s.buffer=d;s.connect(ctx.destination);s.onended=res;s.onerror=rej;s.start();});});});},Promise.resolve());}).then(function(){if(u.onend)u.onend({});}).catch(function(){_o(u);});};})();</script>"
+_HERMES_TTS_JS = r"""<script>(function(){
+  if (window._hermesTTSSpeak) return;
+  var _native = window.speechSynthesis.speak.bind(window.speechSynthesis);
+  var _AC = window.AudioContext || window.webkitAudioContext;
+  var _ctx = null, _activeCancel = null;
+  function _audioCtx(){
+    if (!_ctx && _AC) { try { _ctx = new _AC(); } catch(e){ return null; } }
+    if (_ctx && _ctx.state === "suspended") { try { _ctx.resume(); } catch(e){} }
+    return _ctx;
+  }
+  // Split into sentence-sized chunks (hard-split >220 chars at a comma) so each
+  // /api/tts request stays small. Chatterbox is ~70ms/char and serializes requests,
+  // so one big request for a whole turn blows past the server timeout (-> 502 ->
+  // silent fallback). Small chunks => first audio in ~2s, no timeout.
+  function _chunks(text){
+    text = (text || "").replace(/\s+/g, " ").trim();
+    var sents = text.match(/[^.!?]+[.!?]*/g) || [text];
+    var out = [];
+    for (var i=0;i<sents.length;i++){
+      var s = sents[i].trim(); if(!s) continue;
+      while (s.length > 220){
+        var cut = s.lastIndexOf(",", 220); if (cut < 80) cut = 220;
+        out.push(s.slice(0, cut).trim()); s = s.slice(cut).trim();
+      }
+      if (s) out.push(s);
+    }
+    return out;
+  }
+  function _synth(text, ctx){
+    return fetch("/api/tts", {method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify({text:text})})
+      .then(function(r){ if(!r.ok) throw new Error("TTS "+r.status); return r.arrayBuffer(); })
+      .then(function(buf){ return ctx.decodeAudioData(buf); });
+  }
+  // Speak text via Chatterbox: sequential playback, prefetching the next chunk only
+  // once the current one starts playing (keeps exactly one synth in flight, since
+  // Chatterbox serializes). opts: {onend, onerror}. Returns a cancel function.
+  window._hermesTTSSpeak = function(text, opts){
+    opts = opts || {};
+    if (_activeCancel) { try { _activeCancel(); } catch(e){} }
+    var chunks = _chunks(text);
+    var ctx = _audioCtx();
+    if (!chunks.length || !ctx){ if(opts.onend) opts.onend(); return function(){}; }
+    var cancelled = false, played = false, curSrc = null, i = 0;
+    var pending = _synth(chunks[0], ctx);
+    function fail(e){ if(cancelled) return; cancelled = true;
+      if (opts.onerror) opts.onerror(e, played); else if (opts.onend) opts.onend(); }
+    function playNext(){
+      if (cancelled) return;
+      if (i >= chunks.length){ if(opts.onend) opts.onend(); return; }
+      pending.then(function(decoded){
+        if (cancelled) return;
+        if (i+1 < chunks.length) pending = _synth(chunks[i+1], ctx);
+        var src = ctx.createBufferSource();
+        src.buffer = decoded; src.connect(ctx.destination); curSrc = src; played = true;
+        src.onended = function(){ i++; playNext(); };
+        src.start();
+      }).catch(fail);
+    }
+    _activeCancel = function(){ cancelled = true; try{ if(curSrc) curSrc.stop(); }catch(e){} };
+    playNext();
+    return _activeCancel;
+  };
+  // Route browser speechSynthesis.speak (read-aloud button) through Chatterbox.
+  window.speechSynthesis.speak = function(u){
+    if (!u || !u.text) return _native(u);
+    window._hermesTTSSpeak(u.text, {
+      onend: function(){ if(u.onend) u.onend({}); },
+      onerror: function(e, played){ if(!played) _native(u); else if(u.onend) u.onend({}); }
+    });
+  };
+})();</script>"""
 
 def _handle_tts_proxy(handler):
     import urllib.request as _ur, json as _j
@@ -5250,7 +5320,7 @@ def _handle_tts_proxy(handler):
     try:
         req = _ur.Request(f"{base}/audio/speech", data=payload,
                           headers={"Content-Type": "application/json"})
-        with _ur.urlopen(req, timeout=30) as resp:
+        with _ur.urlopen(req, timeout=90) as resp:
             audio = resp.read()
     except Exception as exc:
         logger.warning("tts_proxy_error: %s", exc)

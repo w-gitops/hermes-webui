@@ -822,28 +822,21 @@ window._micPendingSend=window._micPendingSend||false;
     }
     if(!clean){ _startListening(); return; }
 
-    // Chatterbox TTS via /api/tts server proxy
-    const _ttsTimeout=setTimeout(()=>{if(_voiceModeActive)_startListening();},30000);
-    fetch('/api/tts',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({text:clean})})
-      .then(r=>{if(!r.ok)throw new Error('TTS '+r.status);return r.arrayBuffer();})
-      .then(buf=>{
-        const ctx=new AudioContext();
-        return ctx.resume().then(()=>ctx.decodeAudioData(buf)).then(decoded=>{
-          const src=ctx.createBufferSource();
-          src.buffer=decoded;
-          src.connect(ctx.destination);
-          src.onended=()=>{clearTimeout(_ttsTimeout);if(_voiceModeActive)setTimeout(()=>_startListening(),500);};
-          src.onerror=()=>{clearTimeout(_ttsTimeout);if(_voiceModeActive)setTimeout(()=>_startListening(),1000);};
-          src.start();
-        });
-      })
-      .catch(()=>{
-        clearTimeout(_ttsTimeout);
-        const utter=new SpeechSynthesisUtterance(clean);
-        utter.onend=()=>{if(_voiceModeActive)setTimeout(()=>_startListening(),500);};
-        utter.onerror=()=>{if(_voiceModeActive)setTimeout(()=>_startListening(),1000);};
-        speechSynthesis.speak(utter);
-      });
+    // Chatterbox TTS via the shared streaming helper (chunked + sequential; defined
+    // in _HERMES_TTS_JS). Sending the whole turn as one request blew past the server
+    // timeout on long replies (Chatterbox is ~70ms/char) -> 502 -> silence. The helper
+    // splits into sentence-sized chunks and streams them, so audio starts in ~2s.
+    const _ttsTimeout=setTimeout(()=>{if(_voiceModeActive)_startListening();},180000);
+    const _resume=(ms)=>{clearTimeout(_ttsTimeout);if(_voiceModeActive)setTimeout(()=>_startListening(),ms);};
+    if(typeof window._hermesTTSSpeak==='function'){
+      window._hermesTTSSpeak(clean,{onend:()=>_resume(500),onerror:()=>_resume(1000)});
+    }else{
+      // Fallback: native browser speech if the helper isn't present.
+      const utter=new SpeechSynthesisUtterance(clean);
+      utter.onend=()=>_resume(500);
+      utter.onerror=()=>_resume(1000);
+      speechSynthesis.speak(utter);
+    }
   }
 
   // Hook into response completion — observe when the agent finishes
