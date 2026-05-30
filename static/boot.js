@@ -822,29 +822,28 @@ window._micPendingSend=window._micPendingSend||false;
     }
     if(!clean){ _startListening(); return; }
 
-    const utter=new SpeechSynthesisUtterance(clean);
-
-    // Apply saved voice preferences
-    const savedVoice=localStorage.getItem('hermes-tts-voice');
-    const voices=speechSynthesis.getVoices();
-    if(savedVoice&&voices.length){
-      const match=voices.find(v=>v.name===savedVoice);
-      if(match) utter.voice=match;
-    }
-    const savedRate=parseFloat(localStorage.getItem('hermes-tts-rate'));
-    if(!isNaN(savedRate)) utter.rate=Math.min(2,Math.max(0.5,savedRate));
-    const savedPitch=parseFloat(localStorage.getItem('hermes-tts-pitch'));
-    if(!isNaN(savedPitch)) utter.pitch=Math.min(2,Math.max(0,savedPitch));
-
-    utter.onend=()=>{
-      // After speaking, go back to listening
-      if(_voiceModeActive) setTimeout(()=>_startListening(),500);
-    };
-    utter.onerror=()=>{
-      if(_voiceModeActive) setTimeout(()=>_startListening(),1000);
-    };
-
-    speechSynthesis.speak(utter);
+    // Chatterbox TTS via /api/tts server proxy
+    const _ttsTimeout=setTimeout(()=>{if(_voiceModeActive)_startListening();},30000);
+    fetch('/api/tts',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({text:clean})})
+      .then(r=>{if(!r.ok)throw new Error('TTS '+r.status);return r.arrayBuffer();})
+      .then(buf=>{
+        const ctx=new AudioContext();
+        return ctx.resume().then(()=>ctx.decodeAudioData(buf)).then(decoded=>{
+          const src=ctx.createBufferSource();
+          src.buffer=decoded;
+          src.connect(ctx.destination);
+          src.onended=()=>{clearTimeout(_ttsTimeout);if(_voiceModeActive)setTimeout(()=>_startListening(),500);};
+          src.onerror=()=>{clearTimeout(_ttsTimeout);if(_voiceModeActive)setTimeout(()=>_startListening(),1000);};
+          src.start();
+        });
+      })
+      .catch(()=>{
+        clearTimeout(_ttsTimeout);
+        const utter=new SpeechSynthesisUtterance(clean);
+        utter.onend=()=>{if(_voiceModeActive)setTimeout(()=>_startListening(),500);};
+        utter.onerror=()=>{if(_voiceModeActive)setTimeout(()=>_startListening(),1000);};
+        speechSynthesis.speak(utter);
+      });
   }
 
   // Hook into response completion — observe when the agent finishes

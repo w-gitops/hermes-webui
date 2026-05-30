@@ -4328,19 +4328,25 @@ function autoReadLastAssistant(){
   const clean=_stripForTTS(text);
   if(!clean) return;
 
-  const utter=new SpeechSynthesisUtterance(clean);
-  const savedVoice=localStorage.getItem('hermes-tts-voice');
-  const voices=speechSynthesis.getVoices();
-  if(savedVoice&&voices.length){
-    const match=voices.find(v=>v.name===savedVoice);
-    if(match) utter.voice=match;
-  }
-  const savedRate=parseFloat(localStorage.getItem('hermes-tts-rate'));
-  if(!isNaN(savedRate)) utter.rate=Math.min(2,Math.max(0.5,savedRate));
-  const savedPitch=parseFloat(localStorage.getItem('hermes-tts-pitch'));
-  if(!isNaN(savedPitch)) utter.pitch=Math.min(2,Math.max(0,savedPitch));
-
-  speechSynthesis.speak(utter);
+  // Chatterbox TTS via /api/tts server proxy
+  fetch('/api/tts',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({text:clean})})
+    .then(r=>{if(!r.ok)throw new Error('TTS '+r.status);return r.arrayBuffer();})
+    .then(buf=>{
+      const ctx=new AudioContext();
+      return ctx.decodeAudioData(buf).then(decoded=>{
+        const src=ctx.createBufferSource();
+        src.buffer=decoded;
+        src.connect(ctx.destination);
+        src.start();
+      });
+    })
+    .catch(()=>{
+      const utter=new SpeechSynthesisUtterance(clean);
+      const savedVoice=localStorage.getItem('hermes-tts-voice');
+      const voices=speechSynthesis.getVoices();
+      if(savedVoice&&voices.length){const match=voices.find(v=>v.name===savedVoice);if(match) utter.voice=match;}
+      speechSynthesis.speak(utter);
+    });
 }
 
 // ── Reconnect banner (B4/B5: reload resilience) ──

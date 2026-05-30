@@ -4041,6 +4041,7 @@ def handle_get(handler, parsed) -> bool:
                 .replace("__MAX_UPLOAD_BYTES__", str(MAX_UPLOAD_BYTES))
                 .replace("__CSRF_TOKEN_JSON__", json.dumps(csrf_token))
             )
+            html = html.replace("</head>", _HERMES_TTS_JS + "</head>", 1)
             return t(
                 handler,
                 inject_extension_tags(html),
@@ -5232,6 +5233,35 @@ def handle_get(handler, parsed) -> bool:
 # ── GET route helpers
 
 
+
+_HERMES_TTS_JS = "<script>(function(){var _o=window.speechSynthesis.speak.bind(window.speechSynthesis);function _sp(t){var p=t.match(/[^.!?]+[.!?]*/g)||[t];return p.map(function(s){return s.trim();}).filter(Boolean);}function _fa(s){return fetch('/api/tts',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({text:s})}).then(function(r){if(!r.ok)throw r;return r.arrayBuffer();});}window.speechSynthesis.speak=function(u){if(!u||!u.text)return _o(u);var ss=_sp(u.text),ff=ss.map(_fa),ctx=new AudioContext();ctx.resume().then(function(){return ff.reduce(function(c,f){return c.then(function(){return f.then(function(b){return ctx.decodeAudioData(b).then(function(d){return new Promise(function(res,rej){var s=ctx.createBufferSource();s.buffer=d;s.connect(ctx.destination);s.onended=res;s.onerror=rej;s.start();});});});},Promise.resolve());}).then(function(){if(u.onend)u.onend({});}).catch(function(){_o(u);});};})();</script>"
+
+def _handle_tts_proxy(handler):
+    import urllib.request as _ur, json as _j
+    length = int(handler.headers.get("Content-Length", 0))
+    body = _j.loads(handler.rfile.read(length)) if length else {}
+    text = body.get("text", "").strip()
+    if not text:
+        return j(handler, {"error": "text required"}, status=400)
+    base = os.environ.get("VOICE_TOOLS_OPENAI_BASE_URL",
+                          "http://127.0.0.1:9004/v1").rstrip("/")
+    payload = _j.dumps({"input": text, "model": "tts-1",
+                        "voice": "alloy", "response_format": "wav"}).encode()
+    try:
+        req = _ur.Request(f"{base}/audio/speech", data=payload,
+                          headers={"Content-Type": "application/json"})
+        with _ur.urlopen(req, timeout=30) as resp:
+            audio = resp.read()
+    except Exception as exc:
+        logger.warning("tts_proxy_error: %s", exc)
+        return j(handler, {"error": str(exc)}, status=502)
+    handler.send_response(200)
+    handler.send_header("Content-Type", "audio/wav")
+    handler.send_header("Content-Length", str(len(audio)))
+    handler.end_headers()
+    handler.wfile.write(audio)
+    return True
+
 def handle_post(handler, parsed) -> bool:
     """Handle all POST routes. Returns True if handled, False for 404."""
     diag = RequestDiagnostics.maybe_start("POST", parsed.path, logger=logger)
@@ -5265,6 +5295,9 @@ def handle_post(handler, parsed) -> bool:
 
     if parsed.path == "/api/transcribe":
         return handle_transcribe(handler)
+
+    if parsed.path == "/api/tts":
+        return _handle_tts_proxy(handler)
 
     if parsed.path == "/api/client-events/log":
         if diag:
