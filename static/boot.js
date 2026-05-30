@@ -854,6 +854,16 @@ window._micPendingSend=window._micPendingSend||false;
     }
   };
 
+  // Incremental voice-mode TTS bridge. The messages.js SSE 'token' handler feeds
+  // window._hermesAutoRead, which (now that voice mode is no longer blocked) streams
+  // Chatterbox audio as sentences settle — so speech starts mid-generation instead of
+  // waiting for _speakResponse() at completion. These hooks wire that engine back into
+  // the voice-mode state machine: show "speaking" when audio begins, resume listening
+  // when the whole turn has been spoken. Setting state to 'speaking' here also prevents
+  // the completion-time _speakResponse() fallback (it guards on state==='thinking').
+  window._hermesVoiceSpeakStart=function(){ if(_voiceModeActive){ _voiceModeThinkingSid=null; _setState('speaking'); } };
+  window._hermesVoiceSpeakEnd=function(){ if(_voiceModeActive){ setTimeout(()=>{ if(_voiceModeActive) _startListening(); }, 500); } };
+
   // Observe S.busy changes to detect response completion
   // The existing code calls setBusy(false) when response completes
   const _origSetBusy=(typeof setBusy==='function')?setBusy.bind(window):null;

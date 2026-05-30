@@ -5297,7 +5297,7 @@ _HERMES_TTS_JS = r"""<script>(function(){
       if (cancelled) return;
       if (audioQ.length){
         var d=audioQ.shift(); var src=ctx.createBufferSource();
-        src.buffer=d; src.connect(ctx.destination); curSrc=src; played=true;
+        src.buffer=d; src.connect(ctx.destination); curSrc=src; if(!played&&opts.onstart){try{opts.onstart();}catch(e){}} played=true;
         src.onended=function(){ consume(); };
         try{ src.start(); }catch(e){ consume(); }
         return;
@@ -5328,7 +5328,7 @@ _HERMES_TTS_JS = r"""<script>(function(){
   window._hermesAutoRead = (function(){
     var stream=null, spokenLen=0, lastFull="";
     function enabled(){ try{ return localStorage.getItem("hermes-tts-auto-read")==="true"; }catch(e){ return false; } }
-    function blocked(){ return !!window._voiceModeActive; }
+    function _vmActive(){ try{ return (typeof window._voiceModeActive==="function") ? !!window._voiceModeActive() : !!window._voiceModeActive; }catch(e){ return false; } }
     function _settled(full, isFinal){
       var tail = full.slice(spokenLen);
       var fences = (tail.match(/```/g)||[]).length;          // don't read inside an open code fence
@@ -5354,8 +5354,8 @@ _HERMES_TTS_JS = r"""<script>(function(){
         }
         lastFull = full;
         if (!stream){
-          if (!enabled() || blocked()) return;
-          stream = window._hermesTTSStream({});
+          if (!enabled() && !_vmActive()) return;
+          stream = window._hermesTTSStream({ onstart:function(){ if(window._hermesVoiceSpeakStart){try{window._hermesVoiceSpeakStart();}catch(e){}} }, onend:function(){ if(window._hermesVoiceSpeakEnd){try{window._hermesVoiceSpeakEnd();}catch(e){}} } });
         }
         _emit(_settled(full, false));
       },
