@@ -822,29 +822,21 @@ window._micPendingSend=window._micPendingSend||false;
     }
     if(!clean){ _startListening(); return; }
 
-    const utter=new SpeechSynthesisUtterance(clean);
-
-    // Apply saved voice preferences
-    const savedVoice=localStorage.getItem('hermes-tts-voice');
-    const voices=speechSynthesis.getVoices();
-    if(savedVoice&&voices.length){
-      const match=voices.find(v=>v.name===savedVoice);
-      if(match) utter.voice=match;
+    // Chatterbox TTS via the shared streaming helper (chunked + sequential; defined
+    // in _HERMES_TTS_JS). Sending the whole turn as one request blew past the server
+    // timeout on long replies (Chatterbox is ~70ms/char) -> 502 -> silence. The helper
+    // splits into sentence-sized chunks and streams them, so audio starts in ~2s.
+    const _ttsTimeout=setTimeout(()=>{if(_voiceModeActive)_startListening();},180000);
+    const _resume=(ms)=>{clearTimeout(_ttsTimeout);if(_voiceModeActive)setTimeout(()=>_startListening(),ms);};
+    if(typeof window._hermesTTSSpeak==='function'){
+      window._hermesTTSSpeak(clean,{onend:()=>_resume(500),onerror:()=>_resume(1000)});
+    }else{
+      // Fallback: native browser speech if the helper isn't present.
+      const utter=new SpeechSynthesisUtterance(clean);
+      utter.onend=()=>_resume(500);
+      utter.onerror=()=>_resume(1000);
+      speechSynthesis.speak(utter);
     }
-    const savedRate=parseFloat(localStorage.getItem('hermes-tts-rate'));
-    if(!isNaN(savedRate)) utter.rate=Math.min(2,Math.max(0.5,savedRate));
-    const savedPitch=parseFloat(localStorage.getItem('hermes-tts-pitch'));
-    if(!isNaN(savedPitch)) utter.pitch=Math.min(2,Math.max(0,savedPitch));
-
-    utter.onend=()=>{
-      // After speaking, go back to listening
-      if(_voiceModeActive) setTimeout(()=>_startListening(),500);
-    };
-    utter.onerror=()=>{
-      if(_voiceModeActive) setTimeout(()=>_startListening(),1000);
-    };
-
-    speechSynthesis.speak(utter);
   }
 
   // Hook into response completion — observe when the agent finishes
@@ -861,6 +853,16 @@ window._micPendingSend=window._micPendingSend||false;
       },400);
     }
   };
+
+  // Incremental voice-mode TTS bridge. The messages.js SSE 'token' handler feeds
+  // window._hermesAutoRead, which (now that voice mode is no longer blocked) streams
+  // Chatterbox audio as sentences settle — so speech starts mid-generation instead of
+  // waiting for _speakResponse() at completion. These hooks wire that engine back into
+  // the voice-mode state machine: show "speaking" when audio begins, resume listening
+  // when the whole turn has been spoken. Setting state to 'speaking' here also prevents
+  // the completion-time _speakResponse() fallback (it guards on state==='thinking').
+  window._hermesVoiceSpeakStart=function(){ if(_voiceModeActive){ _voiceModeThinkingSid=null; _setState('speaking'); } };
+  window._hermesVoiceSpeakEnd=function(){ if(_voiceModeActive){ setTimeout(()=>{ if(_voiceModeActive) _startListening(); }, 500); } };
 
   // Observe S.busy changes to detect response completion
   // The existing code calls setBusy(false) when response completes

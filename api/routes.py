@@ -4041,6 +4041,7 @@ def handle_get(handler, parsed) -> bool:
                 .replace("__MAX_UPLOAD_BYTES__", str(MAX_UPLOAD_BYTES))
                 .replace("__CSRF_TOKEN_JSON__", json.dumps(csrf_token))
             )
+            html = html.replace("</head>", _HERMES_TTS_JS + "</head>", 1)
             return t(
                 handler,
                 inject_extension_tags(html),
@@ -5232,6 +5233,191 @@ def handle_get(handler, parsed) -> bool:
 # ── GET route helpers
 
 
+
+_HERMES_TTS_JS = r"""<script>(function(){
+  if (window._hermesTTSStream) return;
+  var _native = window.speechSynthesis.speak.bind(window.speechSynthesis);
+  var _nativeCancel = window.speechSynthesis.cancel.bind(window.speechSynthesis);
+  var _AC = window.AudioContext || window.webkitAudioContext;
+  var _ctx = null, _activeCancel = null;
+  function _audioCtx(){
+    if (!_ctx && _AC) { try { _ctx = new _AC(); } catch(e){ return null; } }
+    if (_ctx && _ctx.state === "suspended") { try { _ctx.resume(); } catch(e){} }
+    return _ctx;
+  }
+  // Clause-sized chunks so each /api/tts request stays small. Chatterbox synthesizes
+  // at roughly real-time speed on our GPU (~47ms/char + ~1.1s fixed), so a 180-char
+  // chunk means 12-19s of dead air before its audio exists. Caps ramp up with the
+  // chunk's position in the stream (_CHUNK_RAMP then _CHUNK_MAX): early chunks are
+  // small so speech starts in ~4s (instead of ~20s on long messages / chat switch)
+  // and the playback buffer can build; later chunks are bigger for synth efficiency.
+  var _CHUNK_RAMP = [60, 80], _CHUNK_MAX = 110;
+  function _chunks(text, startIdx){
+    text = (text || "").replace(/\s+/g, " ").trim();
+    var sents = text.match(/[^.!?]+[.!?]*/g) || [text];
+    var out = [];
+    function cap(){ var c = _CHUNK_RAMP[startIdx + out.length]; return c || _CHUNK_MAX; }
+    for (var i=0;i<sents.length;i++){
+      var s = sents[i].trim();
+      while (s.length > cap()){
+        // Split at clause punctuation (kept with its chunk so prosody pauses
+        // naturally), falling back to a word boundary, then a hard cut.
+        var max = cap(), w = s.slice(0, max);
+        var cut = Math.max(w.lastIndexOf(","), w.lastIndexOf(";"), w.lastIndexOf(":")) + 1;
+        if (cut < 26) cut = w.lastIndexOf(" ") + 1;
+        if (cut < 26) cut = max;
+        out.push(s.slice(0, cut).trim());
+        s = s.slice(cut).replace(/^[,;:\s]+/, "");
+      }
+      if (s) out.push(s);
+    }
+    return out;
+  }
+  // Streaming engine: push() text anytime, end() when done. Synthesizes one request at
+  // a time (one GPU - concurrent requests just contend) but keeps synthesizing AHEAD of
+  // playback to build a buffer -> gap-free. AbortController cancels in-flight synth on a
+  // new utterance.
+  window._hermesTTSStream = function(opts){
+    opts = opts || {};
+    if (_activeCancel) { try { _activeCancel(); } catch(e){} }
+    var ctx = _audioCtx();
+    var noop = function(){};
+    if (!ctx){ if(opts.onend) opts.onend(); return {push:noop,end:noop,cancel:noop}; }
+    var cancelled=false, played=false, curSrc=null, ended=false, synthing=false, errored=false, nChunks=0;
+    var ac = (typeof AbortController !== "undefined") ? new AbortController() : null;
+    var chunkQ=[], audioQ=[], waiter=null;
+    function _wake(){ if(waiter){ var w=waiter; waiter=null; w(); } }
+    function _synth(t){
+      var init={method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({text:t})};
+      if(ac) init.signal=ac.signal;
+      return fetch("/api/tts",init)
+        .then(function(r){ if(!r.ok) throw new Error("TTS "+r.status); return r.arrayBuffer(); })
+        .then(function(b){ return ctx.decodeAudioData(b); });
+    }
+    function pump(){
+      if (cancelled || synthing) return;
+      if (!chunkQ.length){ if(ended) _wake(); return; }
+      synthing=true;
+      _synth(chunkQ.shift()).then(function(dec){
+        synthing=false; if(cancelled) return;
+        audioQ.push(dec); _wake(); pump();
+      }).catch(function(e){
+        synthing=false; if(cancelled) return;
+        errored=true; _wake(); pump();
+      });
+    }
+    function consume(){
+      if (cancelled) return;
+      if (audioQ.length){
+        var d=audioQ.shift(); var src=ctx.createBufferSource();
+        src.buffer=d; src.connect(ctx.destination); curSrc=src; if(!played&&opts.onstart){try{opts.onstart();}catch(e){}} played=true;
+        src.onended=function(){ consume(); };
+        try{ src.start(); }catch(e){ consume(); }
+        return;
+      }
+      if (ended && !chunkQ.length && !synthing){
+        if (errored && !played){ if(opts.onerror) opts.onerror(); else if(opts.onend) opts.onend(); }
+        else if (opts.onend) opts.onend();
+        return;
+      }
+      waiter=consume;
+    }
+    _activeCancel=function(){ cancelled=true; try{if(ac)ac.abort();}catch(e){} try{if(curSrc)curSrc.stop();}catch(e){} };
+    consume();
+    return {
+      push:function(text){ var cs=_chunks(text, nChunks); nChunks+=cs.length; for(var i=0;i<cs.length;i++) chunkQ.push(cs[i]); pump(); },
+      end:function(){ ended=true; pump(); _wake(); },
+      cancel:function(){ if(_activeCancel) _activeCancel(); }
+    };
+  };
+  // One-shot: speak a complete string (read-aloud button, voice mode, fallback).
+  window._hermesTTSSpeak = function(text, opts){
+    var s = window._hermesTTSStream(opts||{});
+    s.push(text||""); s.end();
+    return s.cancel;
+  };
+  // Auto-read manager: fed the live cumulative visible text as the agent streams;
+  // speaks complete sentences as they settle so playback starts mid-generation.
+  window._hermesAutoRead = (function(){
+    var stream=null, spokenLen=0, lastFull="";
+    function enabled(){ try{ return localStorage.getItem("hermes-tts-auto-read")==="true"; }catch(e){ return false; } }
+    function _vmActive(){ try{ return (typeof window._voiceModeActive==="function") ? !!window._voiceModeActive() : !!window._voiceModeActive; }catch(e){ return false; } }
+    function _settled(full, isFinal){
+      var tail = full.slice(spokenLen);
+      var fences = (tail.match(/```/g)||[]).length;          // don't read inside an open code fence
+      if (fences % 2 === 1){ var lf = tail.lastIndexOf("```"); tail = (lf>0 ? tail.slice(0,lf) : ""); }
+      if (!isFinal){
+        var m = tail.match(/[\s\S]*[.!?\n]/);                 // only up to the last complete sentence/line
+        tail = m ? m[0] : "";
+      }
+      return tail;
+    }
+    function _emit(raw){
+      if (!raw) return;
+      spokenLen += raw.length;
+      var clean = (typeof window._stripForTTS==="function") ? window._stripForTTS(raw) : raw;
+      if (clean && clean.trim() && stream) stream.push(clean);
+    }
+    return {
+      feed: function(full){
+        full = full || "";
+        if (spokenLen > full.length){                         // shrank -> new/regenerated turn: reset
+          if (stream) stream.cancel();
+          stream=null; spokenLen=0; lastFull="";
+        }
+        lastFull = full;
+        if (!stream){
+          if (!enabled() && !_vmActive()) return;
+          stream = window._hermesTTSStream({ onstart:function(){ if(window._hermesVoiceSpeakStart){try{window._hermesVoiceSpeakStart();}catch(e){}} }, onend:function(){ if(window._hermesVoiceSpeakEnd){try{window._hermesVoiceSpeakEnd();}catch(e){}} } });
+        }
+        _emit(_settled(full, false));
+      },
+      finish: function(){
+        if (!stream) return false;                            // wasn't streaming -> let legacy read handle it
+        _emit(lastFull.slice(spokenLen));                     // flush the final partial sentence
+        stream.end();
+        stream=null; spokenLen=0; lastFull="";
+        return true;
+      }
+    };
+  })();
+  // Route browser speechSynthesis through Chatterbox; hook cancel for the stop button.
+  window.speechSynthesis.speak = function(u){
+    if (!u || !u.text) return _native(u);
+    window._hermesTTSSpeak(u.text, {
+      onend: function(){ if(u.onend) u.onend({}); },
+      onerror: function(){ _native(u); }
+    });
+  };
+  window.speechSynthesis.cancel = function(){ if (_activeCancel){ try{ _activeCancel(); }catch(e){} } _nativeCancel(); };
+})();</script>"""
+
+def _handle_tts_proxy(handler):
+    import urllib.request as _ur, json as _j
+    length = int(handler.headers.get("Content-Length", 0))
+    body = _j.loads(handler.rfile.read(length)) if length else {}
+    text = body.get("text", "").strip()
+    if not text:
+        return j(handler, {"error": "text required"}, status=400)
+    base = os.environ.get("VOICE_TOOLS_OPENAI_BASE_URL",
+                          "http://127.0.0.1:9004/v1").rstrip("/")
+    payload = _j.dumps({"input": text, "model": "tts-1",
+                        "voice": "alloy", "response_format": "mp3"}).encode()
+    try:
+        req = _ur.Request(f"{base}/audio/speech", data=payload,
+                          headers={"Content-Type": "application/json"})
+        with _ur.urlopen(req, timeout=90) as resp:
+            audio = resp.read()
+    except Exception as exc:
+        logger.warning("tts_proxy_error: %s", exc)
+        return j(handler, {"error": str(exc)}, status=502)
+    handler.send_response(200)
+    handler.send_header("Content-Type", "audio/mpeg")
+    handler.send_header("Content-Length", str(len(audio)))
+    handler.end_headers()
+    handler.wfile.write(audio)
+    return True
+
 def handle_post(handler, parsed) -> bool:
     """Handle all POST routes. Returns True if handled, False for 404."""
     diag = RequestDiagnostics.maybe_start("POST", parsed.path, logger=logger)
@@ -5265,6 +5451,9 @@ def handle_post(handler, parsed) -> bool:
 
     if parsed.path == "/api/transcribe":
         return handle_transcribe(handler)
+
+    if parsed.path == "/api/tts":
+        return _handle_tts_proxy(handler)
 
     if parsed.path == "/api/client-events/log":
         if diag:
