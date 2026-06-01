@@ -5245,32 +5245,45 @@ _HERMES_TTS_JS = r"""<script>(function(){
     if (_ctx && _ctx.state === "suspended") { try { _ctx.resume(); } catch(e){} }
     return _ctx;
   }
-  // Sentence-sized chunks (hard-split >180 chars at a comma) so each /api/tts request
-  // stays small: Chatterbox is ~70ms/char and serializes, so big requests time out.
-  function _chunks(text){
+  // Clause-sized chunks so each /api/tts request stays small. Chatterbox synthesizes
+  // at roughly real-time speed on our GPU (~47ms/char + ~1.1s fixed), so a 180-char
+  // chunk means 12-19s of dead air before its audio exists. Caps ramp up with the
+  // chunk's position in the stream (_CHUNK_RAMP then _CHUNK_MAX): early chunks are
+  // small so speech starts in ~4s (instead of ~20s on long messages / chat switch)
+  // and the playback buffer can build; later chunks are bigger for synth efficiency.
+  var _CHUNK_RAMP = [60, 80], _CHUNK_MAX = 110;
+  function _chunks(text, startIdx){
     text = (text || "").replace(/\s+/g, " ").trim();
     var sents = text.match(/[^.!?]+[.!?]*/g) || [text];
     var out = [];
+    function cap(){ var c = _CHUNK_RAMP[startIdx + out.length]; return c || _CHUNK_MAX; }
     for (var i=0;i<sents.length;i++){
-      var s = sents[i].trim(); if(!s) continue;
-      while (s.length > 180){
-        var cut = s.lastIndexOf(",", 180); if (cut < 60) cut = 180;
-        out.push(s.slice(0, cut).trim()); s = s.slice(cut).trim();
+      var s = sents[i].trim();
+      while (s.length > cap()){
+        // Split at clause punctuation (kept with its chunk so prosody pauses
+        // naturally), falling back to a word boundary, then a hard cut.
+        var max = cap(), w = s.slice(0, max);
+        var cut = Math.max(w.lastIndexOf(","), w.lastIndexOf(";"), w.lastIndexOf(":")) + 1;
+        if (cut < 26) cut = w.lastIndexOf(" ") + 1;
+        if (cut < 26) cut = max;
+        out.push(s.slice(0, cut).trim());
+        s = s.slice(cut).replace(/^[,;:\s]+/, "");
       }
       if (s) out.push(s);
     }
     return out;
   }
   // Streaming engine: push() text anytime, end() when done. Synthesizes one request at
-  // a time (Chatterbox serializes) but keeps synthesizing AHEAD of playback to build a
-  // buffer -> gap-free. AbortController cancels in-flight synth on a new utterance.
+  // a time (one GPU - concurrent requests just contend) but keeps synthesizing AHEAD of
+  // playback to build a buffer -> gap-free. AbortController cancels in-flight synth on a
+  // new utterance.
   window._hermesTTSStream = function(opts){
     opts = opts || {};
     if (_activeCancel) { try { _activeCancel(); } catch(e){} }
     var ctx = _audioCtx();
     var noop = function(){};
     if (!ctx){ if(opts.onend) opts.onend(); return {push:noop,end:noop,cancel:noop}; }
-    var cancelled=false, played=false, curSrc=null, ended=false, synthing=false, errored=false;
+    var cancelled=false, played=false, curSrc=null, ended=false, synthing=false, errored=false, nChunks=0;
     var ac = (typeof AbortController !== "undefined") ? new AbortController() : null;
     var chunkQ=[], audioQ=[], waiter=null;
     function _wake(){ if(waiter){ var w=waiter; waiter=null; w(); } }
@@ -5312,7 +5325,7 @@ _HERMES_TTS_JS = r"""<script>(function(){
     _activeCancel=function(){ cancelled=true; try{if(ac)ac.abort();}catch(e){} try{if(curSrc)curSrc.stop();}catch(e){} };
     consume();
     return {
-      push:function(text){ var cs=_chunks(text); for(var i=0;i<cs.length;i++) chunkQ.push(cs[i]); pump(); },
+      push:function(text){ var cs=_chunks(text, nChunks); nChunks+=cs.length; for(var i=0;i<cs.length;i++) chunkQ.push(cs[i]); pump(); },
       end:function(){ ended=true; pump(); _wake(); },
       cancel:function(){ if(_activeCancel) _activeCancel(); }
     };
