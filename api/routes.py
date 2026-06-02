@@ -77,6 +77,16 @@ _CSP_REPORT_RATE_LIMIT_WINDOW_SECONDS = 60
 _CSP_REPORT_RATE_LIMIT_MAX = 100
 _CSP_REPORT_MAX_BODY_BYTES = 64 * 1024
 _CLIENT_EVENT_LOGGER = logging.getLogger("client_event")
+# This install runs server.py without a root logging handler, so INFO records fall
+# through to Python's last-resort handler (WARNING+ only) and client diagnostics
+# never reach journald. Client events exist precisely to be seen server-side:
+# give the logger its own stderr handler so payloads land in the journal.
+if not _CLIENT_EVENT_LOGGER.handlers:
+    _client_event_handler = logging.StreamHandler()
+    _client_event_handler.setFormatter(logging.Formatter("[client-event] %(message)s"))
+    _CLIENT_EVENT_LOGGER.addHandler(_client_event_handler)
+    _CLIENT_EVENT_LOGGER.setLevel(logging.INFO)
+    _CLIENT_EVENT_LOGGER.propagate = False
 _CLIENT_EVENT_RATE_LIMIT: dict[str, list[float]] = {}
 _CLIENT_EVENT_RATE_LIMIT_LOCK = threading.Lock()
 _CLIENT_EVENT_RATE_LIMIT_WINDOW_SECONDS = 60
@@ -5239,12 +5249,100 @@ _HERMES_TTS_JS = r"""<script>(function(){
   var _native = window.speechSynthesis.speak.bind(window.speechSynthesis);
   var _nativeCancel = window.speechSynthesis.cancel.bind(window.speechSynthesis);
   var _AC = window.AudioContext || window.webkitAudioContext;
-  var _ctx = null, _activeCancel = null;
+  var _ctx = null, _activeCancel = null, _unlockOn = false;
+  // TTS client telemetry: mirror key playback-state transitions to the server
+  // (journalctl -u hermes-webui, logger "client_event") via the existing
+  // /api/client-events/log channel, so silent-playback failures are visible
+  // server-side. Console gets the same line for live debugging.
+  function _diag(ev, reason){
+    try{ console.warn("[hermes-tts]", ev, reason || ""); }catch(e){}
+    try{
+      if (typeof window.api === "function")
+        window.api("/api/client-events/log", {method:"POST",
+          body: JSON.stringify({event: String(ev).slice(0,64), source: "tts",
+                                reason: String(reason || "").slice(0,160)}),
+          timeoutMs: 3000, timeoutToast: false}).catch(function(){});
+    }catch(e){}
+  }
+  // iOS/WebKit ringer-switch fix: iOS mutes Web Audio API output while the device is
+  // in silent mode, but does NOT mute HTML media elements (this is why YouTube plays
+  // sound in silent mode while TTS is inaudible despite a running AudioContext).
+  // Playing a silent, looping <audio> element switches the page's audio session to
+  // the "playback" category, after which Web Audio output ignores the switch too
+  // (the unmute.js technique). Must be started from inside a user gesture handler.
+  var _silentEl = null;
+  function _silentWavURL(){
+    // 0.1s of 16-bit mono silence @ 8kHz, built in-memory (no asset needed).
+    var n = 800, buf = new ArrayBuffer(44 + n * 2), dv = new DataView(buf);
+    function ws(o, s){ for (var i = 0; i < s.length; i++) dv.setUint8(o + i, s.charCodeAt(i)); }
+    ws(0, "RIFF"); dv.setUint32(4, 36 + n * 2, true); ws(8, "WAVEfmt ");
+    dv.setUint32(16, 16, true); dv.setUint16(20, 1, true); dv.setUint16(22, 1, true);
+    dv.setUint32(24, 8000, true); dv.setUint32(28, 16000, true);
+    dv.setUint16(32, 2, true); dv.setUint16(34, 16, true);
+    ws(36, "data"); dv.setUint32(40, n * 2, true);
+    return URL.createObjectURL(new Blob([buf], {type: "audio/wav"}));
+  }
+  function _mediaUnmute(){
+    if (_silentEl) return;
+    try{
+      var el = document.createElement("audio");
+      el.setAttribute("playsinline", "");
+      el.loop = true;
+      el.src = _silentWavURL();
+      var p = el.play();
+      if (p && p.then){
+        p.then(function(){ _diag("tts_media_session", "playback category engaged (silent-switch immune)"); })
+         .catch(function(e){ _silentEl = null; _diag("tts_media_session_failed", (e && e.message) || String(e)); });
+      }
+      _silentEl = el;
+    }catch(e){ _silentEl = null; }
+  }
+  // One-time environment report so device/browser quirks are visible in telemetry.
+  var _envSent = false;
+  function _envDiag(){
+    if (_envSent) return; _envSent = true;
+    try{
+      _diag("tts_env", ((navigator.platform || "?") + " touch=" + (navigator.maxTouchPoints || 0) +
+        " " + (navigator.userAgent || "")).slice(0, 158));
+    }catch(e){}
+  }
+  // Chrome autoplay policy: an AudioContext created outside a user gesture starts
+  // "suspended", and resume() only succeeds during/after a real gesture. A buffer
+  // source started on a suspended context queues SILENTLY (no error, no onended) --
+  // so every /api/tts request succeeds yet nothing is audible. Fix: create/resume
+  // the context from a capture-phase listener on the next user gesture; the queued
+  // source then starts and the consumer chain continues.
+  function _ensureUnlock(){
+    if (_unlockOn) return;
+    _unlockOn = true;
+    var evs = ["pointerdown", "keydown", "touchend"];
+    function done(){
+      for (var i = 0; i < evs.length; i++) document.removeEventListener(evs[i], unlock, true);
+      _unlockOn = false;
+    }
+    function unlock(){
+      _mediaUnmute();   // synchronously, while we are still inside the gesture
+      if (!_ctx && _AC){ try { _ctx = new _AC(); } catch(e){ done(); return; } }
+      if (!_ctx || _ctx.state === "running"){ done(); return; }
+      try{
+        _ctx.resume().then(function(){
+          if (_ctx.state === "running"){ _diag("tts_audio_unlocked", "AudioContext resumed by user gesture"); done(); }
+        }).catch(function(){});
+      }catch(e){}
+    }
+    for (var i = 0; i < evs.length; i++) document.addEventListener(evs[i], unlock, true);
+  }
   function _audioCtx(){
-    if (!_ctx && _AC) { try { _ctx = new _AC(); } catch(e){ return null; } }
-    if (_ctx && _ctx.state === "suspended") { try { _ctx.resume(); } catch(e){} }
+    if (!_ctx && _AC) { try { _ctx = new _AC(); } catch(e){ _diag("tts_ctx_create_failed", (e && e.message) || String(e)); return null; } }
+    if (_ctx && _ctx.state === "suspended") {
+      try { _ctx.resume(); } catch(e){}
+      _ensureUnlock();
+    }
     return _ctx;
   }
+  // Prime audio on the first gesture after page load: auto-read is driven by SSE events
+  // (no user gesture in its call stack), so the context must already be running by then.
+  _ensureUnlock();
   // Clause-sized chunks so each /api/tts request stays small. Chatterbox synthesizes
   // at roughly real-time speed on our GPU (~47ms/char + ~1.1s fixed), so a 180-char
   // chunk means 12-19s of dead air before its audio exists. Caps ramp up with the
@@ -5273,22 +5371,35 @@ _HERMES_TTS_JS = r"""<script>(function(){
     }
     return out;
   }
+  // Selected Chatterbox voice (name of a registered reference clip in the LXC's
+  // VOICES_DIR). Distinct from "hermes-tts-voice", which holds a *browser*
+  // SpeechSynthesis voice name for the native-speech fallback — different engine,
+  // different namespace, so they must not share a key. Persisted in localStorage
+  // so every server-TTS path (auto-read, voice mode, read-aloud) uses it. Empty
+  // string means "let the server default decide" (env VOICE_TOOLS_TTS_VOICE).
+  window._hermesTTSVoice = function(){
+    try{ return (localStorage.getItem("hermes-tts-chatterbox-voice")||"").trim(); }catch(e){ return ""; }
+  };
   // Streaming engine: push() text anytime, end() when done. Synthesizes one request at
   // a time (one GPU - concurrent requests just contend) but keeps synthesizing AHEAD of
   // playback to build a buffer -> gap-free. AbortController cancels in-flight synth on a
   // new utterance.
   window._hermesTTSStream = function(opts){
     opts = opts || {};
+    if (!opts.voice){ var _v = window._hermesTTSVoice(); if(_v) opts.voice = _v; }
     if (_activeCancel) { try { _activeCancel(); } catch(e){} }
+    _envDiag();
     var ctx = _audioCtx();
     var noop = function(){};
     if (!ctx){ if(opts.onend) opts.onend(); return {push:noop,end:noop,cancel:noop}; }
-    var cancelled=false, played=false, curSrc=null, ended=false, synthing=false, errored=false, nChunks=0;
+    var cancelled=false, played=false, curSrc=null, ended=false, synthing=false, errored=false, nChunks=0, diagSent=false;
     var ac = (typeof AbortController !== "undefined") ? new AbortController() : null;
     var chunkQ=[], audioQ=[], waiter=null;
     function _wake(){ if(waiter){ var w=waiter; waiter=null; w(); } }
     function _synth(t){
-      var init={method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({text:t})};
+      var reqBody={text:t};
+      if(opts.voice) reqBody.voice=opts.voice;   // pass through selected Chatterbox voice
+      var init={method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(reqBody)};
       if(ac) init.signal=ac.signal;
       return fetch("/api/tts",init)
         .then(function(r){ if(!r.ok) throw new Error("TTS "+r.status); return r.arrayBuffer(); })
@@ -5303,6 +5414,7 @@ _HERMES_TTS_JS = r"""<script>(function(){
         audioQ.push(dec); _wake(); pump();
       }).catch(function(e){
         synthing=false; if(cancelled) return;
+        if (!(e && e.name === "AbortError")) _diag("tts_chunk_failed", (e && e.message) || String(e));
         errored=true; _wake(); pump();
       });
     }
@@ -5312,7 +5424,28 @@ _HERMES_TTS_JS = r"""<script>(function(){
         var d=audioQ.shift(); var src=ctx.createBufferSource();
         src.buffer=d; src.connect(ctx.destination); curSrc=src; if(!played&&opts.onstart){try{opts.onstart();}catch(e){}} played=true;
         src.onended=function(){ consume(); };
-        try{ src.start(); }catch(e){ consume(); }
+        try{ src.start(); }catch(e){ _diag("tts_source_start_failed", (e && e.message) || String(e)); consume(); return; }
+        if (!diagSent){ diagSent=true;
+          // 600ms later the context is either rendering (running) or autoplay-blocked.
+          // Also report what Chrome can see of the machine's audio hardware: a running
+          // context with zero audiooutput devices renders into the void (silent), which
+          // is an OS / hardware problem, not an integration problem.
+          setTimeout(function(){
+            if (cancelled) return;
+            function report(hw){
+              if (ctx.state === "running") _diag("tts_playing", "audio output started; " + hw);
+              else _diag("tts_playback_blocked", "AudioContext " + ctx.state + " -- click/tap/keypress anywhere to enable audio; " + hw);
+            }
+            var hw = "dest_ch=" + ctx.destination.maxChannelCount + " rate=" + ctx.sampleRate;
+            try{
+              navigator.mediaDevices.enumerateDevices().then(function(devs){
+                var outs = 0;
+                for (var i = 0; i < devs.length; i++) if (devs[i].kind === "audiooutput") outs++;
+                report(hw + " audiooutputs=" + outs);
+              }).catch(function(){ report(hw); });
+            }catch(e){ report(hw); }
+          }, 600);
+        }
         return;
       }
       if (ended && !chunkQ.length && !synthing){
@@ -5401,8 +5534,17 @@ def _handle_tts_proxy(handler):
         return j(handler, {"error": "text required"}, status=400)
     base = os.environ.get("VOICE_TOOLS_OPENAI_BASE_URL",
                           "http://127.0.0.1:9004/v1").rstrip("/")
-    payload = _j.dumps({"input": text, "model": "tts-1",
-                        "voice": "alloy", "response_format": "mp3"}).encode()
+    # Voice selection: request body wins, else env default, else "alloy" (back-compat).
+    # Chatterbox uses the name to pick a registered reference clip from VOICES_DIR;
+    # an unknown/absent name falls back to its built-in default voice server-side.
+    # Sanitize to a conservative charset so the value is safe to forward verbatim.
+    default_voice = os.environ.get("VOICE_TOOLS_TTS_VOICE", "alloy")
+    voice = str(body.get("voice") or default_voice).strip()[:64]
+    if not re.fullmatch(r"[A-Za-z0-9 _.\-]+", voice or ""):
+        voice = default_voice
+    model = str(body.get("model") or "tts-1").strip()[:64] or "tts-1"
+    payload = _j.dumps({"input": text, "model": model,
+                        "voice": voice, "response_format": "mp3"}).encode()
     try:
         req = _ur.Request(f"{base}/audio/speech", data=payload,
                           headers={"Content-Type": "application/json"})

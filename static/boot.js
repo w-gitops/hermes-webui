@@ -810,7 +810,7 @@ window._micPendingSend=window._micPendingSend||false;
     if(typeof _stripForTTS==='function') clean=_stripForTTS(rawText);
     else{
       // Basic strip: remove code blocks, images, links
-      clean=clean.replace(/```[\s\S]*?```/g,' code block ')
+      clean=clean.replace(/```[\s\S]*?```/g,'. (code block — see screen.) ')
         .replace(/`([^`]*)`/g,'$1')
         .replace(/!\[([^\]]*)\]\([^)]*\)/g,'$1')
         .replace(/\[([^\]]*)\]\([^)]*\)/g,'$1')
