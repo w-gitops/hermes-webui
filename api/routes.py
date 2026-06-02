@@ -5239,12 +5239,57 @@ _HERMES_TTS_JS = r"""<script>(function(){
   var _native = window.speechSynthesis.speak.bind(window.speechSynthesis);
   var _nativeCancel = window.speechSynthesis.cancel.bind(window.speechSynthesis);
   var _AC = window.AudioContext || window.webkitAudioContext;
-  var _ctx = null, _activeCancel = null;
+  var _ctx = null, _activeCancel = null, _unlockOn = false;
+  // TTS client telemetry: mirror key playback-state transitions to the server
+  // (journalctl -u hermes-webui, logger "client_event") via the existing
+  // /api/client-events/log channel, so silent-playback failures are visible
+  // server-side. Console gets the same line for live debugging.
+  function _diag(ev, reason){
+    try{ console.warn("[hermes-tts]", ev, reason || ""); }catch(e){}
+    try{
+      if (typeof window.api === "function")
+        window.api("/api/client-events/log", {method:"POST",
+          body: JSON.stringify({event: String(ev).slice(0,64), source: "tts",
+                                reason: String(reason || "").slice(0,160)}),
+          timeoutMs: 3000, timeoutToast: false}).catch(function(){});
+    }catch(e){}
+  }
+  // Chrome autoplay policy: an AudioContext created outside a user gesture starts
+  // "suspended", and resume() only succeeds during/after a real gesture. A buffer
+  // source started on a suspended context queues SILENTLY (no error, no onended) --
+  // so every /api/tts request succeeds yet nothing is audible. Fix: create/resume
+  // the context from a capture-phase listener on the next user gesture; the queued
+  // source then starts and the consumer chain continues.
+  function _ensureUnlock(){
+    if (_unlockOn) return;
+    _unlockOn = true;
+    var evs = ["pointerdown", "keydown", "touchend"];
+    function done(){
+      for (var i = 0; i < evs.length; i++) document.removeEventListener(evs[i], unlock, true);
+      _unlockOn = false;
+    }
+    function unlock(){
+      if (!_ctx && _AC){ try { _ctx = new _AC(); } catch(e){ done(); return; } }
+      if (!_ctx || _ctx.state === "running"){ done(); return; }
+      try{
+        _ctx.resume().then(function(){
+          if (_ctx.state === "running"){ _diag("tts_audio_unlocked", "AudioContext resumed by user gesture"); done(); }
+        }).catch(function(){});
+      }catch(e){}
+    }
+    for (var i = 0; i < evs.length; i++) document.addEventListener(evs[i], unlock, true);
+  }
   function _audioCtx(){
-    if (!_ctx && _AC) { try { _ctx = new _AC(); } catch(e){ return null; } }
-    if (_ctx && _ctx.state === "suspended") { try { _ctx.resume(); } catch(e){} }
+    if (!_ctx && _AC) { try { _ctx = new _AC(); } catch(e){ _diag("tts_ctx_create_failed", (e && e.message) || String(e)); return null; } }
+    if (_ctx && _ctx.state === "suspended") {
+      try { _ctx.resume(); } catch(e){}
+      _ensureUnlock();
+    }
     return _ctx;
   }
+  // Prime audio on the first gesture after page load: auto-read is driven by SSE events
+  // (no user gesture in its call stack), so the context must already be running by then.
+  _ensureUnlock();
   // Clause-sized chunks so each /api/tts request stays small. Chatterbox synthesizes
   // at roughly real-time speed on our GPU (~47ms/char + ~1.1s fixed), so a 180-char
   // chunk means 12-19s of dead air before its audio exists. Caps ramp up with the
@@ -5293,7 +5338,7 @@ _HERMES_TTS_JS = r"""<script>(function(){
     var ctx = _audioCtx();
     var noop = function(){};
     if (!ctx){ if(opts.onend) opts.onend(); return {push:noop,end:noop,cancel:noop}; }
-    var cancelled=false, played=false, curSrc=null, ended=false, synthing=false, errored=false, nChunks=0;
+    var cancelled=false, played=false, curSrc=null, ended=false, synthing=false, errored=false, nChunks=0, diagSent=false;
     var ac = (typeof AbortController !== "undefined") ? new AbortController() : null;
     var chunkQ=[], audioQ=[], waiter=null;
     function _wake(){ if(waiter){ var w=waiter; waiter=null; w(); } }
@@ -5315,6 +5360,7 @@ _HERMES_TTS_JS = r"""<script>(function(){
         audioQ.push(dec); _wake(); pump();
       }).catch(function(e){
         synthing=false; if(cancelled) return;
+        if (!(e && e.name === "AbortError")) _diag("tts_chunk_failed", (e && e.message) || String(e));
         errored=true; _wake(); pump();
       });
     }
@@ -5324,7 +5370,15 @@ _HERMES_TTS_JS = r"""<script>(function(){
         var d=audioQ.shift(); var src=ctx.createBufferSource();
         src.buffer=d; src.connect(ctx.destination); curSrc=src; if(!played&&opts.onstart){try{opts.onstart();}catch(e){}} played=true;
         src.onended=function(){ consume(); };
-        try{ src.start(); }catch(e){ consume(); }
+        try{ src.start(); }catch(e){ _diag("tts_source_start_failed", (e && e.message) || String(e)); consume(); return; }
+        if (!diagSent){ diagSent=true;
+          // 600ms later the context is either rendering (running) or autoplay-blocked.
+          setTimeout(function(){
+            if (cancelled) return;
+            if (ctx.state === "running") _diag("tts_playing", "audio output started");
+            else _diag("tts_playback_blocked", "AudioContext " + ctx.state + " -- click/tap/keypress anywhere to enable audio");
+          }, 600);
+        }
         return;
       }
       if (ended && !chunkQ.length && !synthing){
