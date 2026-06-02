@@ -5264,6 +5264,48 @@ _HERMES_TTS_JS = r"""<script>(function(){
           timeoutMs: 3000, timeoutToast: false}).catch(function(){});
     }catch(e){}
   }
+  // iOS/WebKit ringer-switch fix: iOS mutes Web Audio API output while the device is
+  // in silent mode, but does NOT mute HTML media elements (this is why YouTube plays
+  // sound in silent mode while TTS is inaudible despite a running AudioContext).
+  // Playing a silent, looping <audio> element switches the page's audio session to
+  // the "playback" category, after which Web Audio output ignores the switch too
+  // (the unmute.js technique). Must be started from inside a user gesture handler.
+  var _silentEl = null;
+  function _silentWavURL(){
+    // 0.1s of 16-bit mono silence @ 8kHz, built in-memory (no asset needed).
+    var n = 800, buf = new ArrayBuffer(44 + n * 2), dv = new DataView(buf);
+    function ws(o, s){ for (var i = 0; i < s.length; i++) dv.setUint8(o + i, s.charCodeAt(i)); }
+    ws(0, "RIFF"); dv.setUint32(4, 36 + n * 2, true); ws(8, "WAVEfmt ");
+    dv.setUint32(16, 16, true); dv.setUint16(20, 1, true); dv.setUint16(22, 1, true);
+    dv.setUint32(24, 8000, true); dv.setUint32(28, 16000, true);
+    dv.setUint16(32, 2, true); dv.setUint16(34, 16, true);
+    ws(36, "data"); dv.setUint32(40, n * 2, true);
+    return URL.createObjectURL(new Blob([buf], {type: "audio/wav"}));
+  }
+  function _mediaUnmute(){
+    if (_silentEl) return;
+    try{
+      var el = document.createElement("audio");
+      el.setAttribute("playsinline", "");
+      el.loop = true;
+      el.src = _silentWavURL();
+      var p = el.play();
+      if (p && p.then){
+        p.then(function(){ _diag("tts_media_session", "playback category engaged (silent-switch immune)"); })
+         .catch(function(e){ _silentEl = null; _diag("tts_media_session_failed", (e && e.message) || String(e)); });
+      }
+      _silentEl = el;
+    }catch(e){ _silentEl = null; }
+  }
+  // One-time environment report so device/browser quirks are visible in telemetry.
+  var _envSent = false;
+  function _envDiag(){
+    if (_envSent) return; _envSent = true;
+    try{
+      _diag("tts_env", ((navigator.platform || "?") + " touch=" + (navigator.maxTouchPoints || 0) +
+        " " + (navigator.userAgent || "")).slice(0, 158));
+    }catch(e){}
+  }
   // Chrome autoplay policy: an AudioContext created outside a user gesture starts
   // "suspended", and resume() only succeeds during/after a real gesture. A buffer
   // source started on a suspended context queues SILENTLY (no error, no onended) --
@@ -5279,6 +5321,7 @@ _HERMES_TTS_JS = r"""<script>(function(){
       _unlockOn = false;
     }
     function unlock(){
+      _mediaUnmute();   // synchronously, while we are still inside the gesture
       if (!_ctx && _AC){ try { _ctx = new _AC(); } catch(e){ done(); return; } }
       if (!_ctx || _ctx.state === "running"){ done(); return; }
       try{
@@ -5345,6 +5388,7 @@ _HERMES_TTS_JS = r"""<script>(function(){
     opts = opts || {};
     if (!opts.voice){ var _v = window._hermesTTSVoice(); if(_v) opts.voice = _v; }
     if (_activeCancel) { try { _activeCancel(); } catch(e){} }
+    _envDiag();
     var ctx = _audioCtx();
     var noop = function(){};
     if (!ctx){ if(opts.onend) opts.onend(); return {push:noop,end:noop,cancel:noop}; }
