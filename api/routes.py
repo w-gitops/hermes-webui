@@ -5383,10 +5383,23 @@ _HERMES_TTS_JS = r"""<script>(function(){
         try{ src.start(); }catch(e){ _diag("tts_source_start_failed", (e && e.message) || String(e)); consume(); return; }
         if (!diagSent){ diagSent=true;
           // 600ms later the context is either rendering (running) or autoplay-blocked.
+          // Also report what Chrome can see of the machine's audio hardware: a running
+          // context with zero audiooutput devices renders into the void (silent), which
+          // is an OS / hardware problem, not an integration problem.
           setTimeout(function(){
             if (cancelled) return;
-            if (ctx.state === "running") _diag("tts_playing", "audio output started");
-            else _diag("tts_playback_blocked", "AudioContext " + ctx.state + " -- click/tap/keypress anywhere to enable audio");
+            function report(hw){
+              if (ctx.state === "running") _diag("tts_playing", "audio output started; " + hw);
+              else _diag("tts_playback_blocked", "AudioContext " + ctx.state + " -- click/tap/keypress anywhere to enable audio; " + hw);
+            }
+            var hw = "dest_ch=" + ctx.destination.maxChannelCount + " rate=" + ctx.sampleRate;
+            try{
+              navigator.mediaDevices.enumerateDevices().then(function(devs){
+                var outs = 0;
+                for (var i = 0; i < devs.length; i++) if (devs[i].kind === "audiooutput") outs++;
+                report(hw + " audiooutputs=" + outs);
+              }).catch(function(){ report(hw); });
+            }catch(e){ report(hw); }
           }, 600);
         }
         return;
