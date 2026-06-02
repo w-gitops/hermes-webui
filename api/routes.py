@@ -77,6 +77,16 @@ _CSP_REPORT_RATE_LIMIT_WINDOW_SECONDS = 60
 _CSP_REPORT_RATE_LIMIT_MAX = 100
 _CSP_REPORT_MAX_BODY_BYTES = 64 * 1024
 _CLIENT_EVENT_LOGGER = logging.getLogger("client_event")
+# This install runs server.py without a root logging handler, so INFO records fall
+# through to Python's last-resort handler (WARNING+ only) and client diagnostics
+# never reach journald. Client events exist precisely to be seen server-side:
+# give the logger its own stderr handler so payloads land in the journal.
+if not _CLIENT_EVENT_LOGGER.handlers:
+    _client_event_handler = logging.StreamHandler()
+    _client_event_handler.setFormatter(logging.Formatter("[client-event] %(message)s"))
+    _CLIENT_EVENT_LOGGER.addHandler(_client_event_handler)
+    _CLIENT_EVENT_LOGGER.setLevel(logging.INFO)
+    _CLIENT_EVENT_LOGGER.propagate = False
 _CLIENT_EVENT_RATE_LIMIT: dict[str, list[float]] = {}
 _CLIENT_EVENT_RATE_LIMIT_LOCK = threading.Lock()
 _CLIENT_EVENT_RATE_LIMIT_WINDOW_SECONDS = 60
