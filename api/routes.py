@@ -5273,12 +5273,22 @@ _HERMES_TTS_JS = r"""<script>(function(){
     }
     return out;
   }
+  // Selected Chatterbox voice (name of a registered reference clip in the LXC's
+  // VOICES_DIR). Distinct from "hermes-tts-voice", which holds a *browser*
+  // SpeechSynthesis voice name for the native-speech fallback — different engine,
+  // different namespace, so they must not share a key. Persisted in localStorage
+  // so every server-TTS path (auto-read, voice mode, read-aloud) uses it. Empty
+  // string means "let the server default decide" (env VOICE_TOOLS_TTS_VOICE).
+  window._hermesTTSVoice = function(){
+    try{ return (localStorage.getItem("hermes-tts-chatterbox-voice")||"").trim(); }catch(e){ return ""; }
+  };
   // Streaming engine: push() text anytime, end() when done. Synthesizes one request at
   // a time (one GPU - concurrent requests just contend) but keeps synthesizing AHEAD of
   // playback to build a buffer -> gap-free. AbortController cancels in-flight synth on a
   // new utterance.
   window._hermesTTSStream = function(opts){
     opts = opts || {};
+    if (!opts.voice){ var _v = window._hermesTTSVoice(); if(_v) opts.voice = _v; }
     if (_activeCancel) { try { _activeCancel(); } catch(e){} }
     var ctx = _audioCtx();
     var noop = function(){};
@@ -5288,7 +5298,9 @@ _HERMES_TTS_JS = r"""<script>(function(){
     var chunkQ=[], audioQ=[], waiter=null;
     function _wake(){ if(waiter){ var w=waiter; waiter=null; w(); } }
     function _synth(t){
-      var init={method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({text:t})};
+      var reqBody={text:t};
+      if(opts.voice) reqBody.voice=opts.voice;   // pass through selected Chatterbox voice
+      var init={method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(reqBody)};
       if(ac) init.signal=ac.signal;
       return fetch("/api/tts",init)
         .then(function(r){ if(!r.ok) throw new Error("TTS "+r.status); return r.arrayBuffer(); })
@@ -5401,8 +5413,17 @@ def _handle_tts_proxy(handler):
         return j(handler, {"error": "text required"}, status=400)
     base = os.environ.get("VOICE_TOOLS_OPENAI_BASE_URL",
                           "http://127.0.0.1:9004/v1").rstrip("/")
-    payload = _j.dumps({"input": text, "model": "tts-1",
-                        "voice": "alloy", "response_format": "mp3"}).encode()
+    # Voice selection: request body wins, else env default, else "alloy" (back-compat).
+    # Chatterbox uses the name to pick a registered reference clip from VOICES_DIR;
+    # an unknown/absent name falls back to its built-in default voice server-side.
+    # Sanitize to a conservative charset so the value is safe to forward verbatim.
+    default_voice = os.environ.get("VOICE_TOOLS_TTS_VOICE", "alloy")
+    voice = str(body.get("voice") or default_voice).strip()[:64]
+    if not re.fullmatch(r"[A-Za-z0-9 _.\-]+", voice or ""):
+        voice = default_voice
+    model = str(body.get("model") or "tts-1").strip()[:64] or "tts-1"
+    payload = _j.dumps({"input": text, "model": model,
+                        "voice": voice, "response_format": "mp3"}).encode()
     try:
         req = _ur.Request(f"{base}/audio/speech", data=payload,
                           headers={"Content-Type": "application/json"})

@@ -43,6 +43,23 @@ class TestTtsUtilityFunctions:
         assert re.search(r'_stripForTTS.*```', src, re.DOTALL), \
             "_stripForTTS must handle fenced code blocks"
 
+    def test_code_block_speaks_audible_cue(self):
+        """_stripForTTS must replace code blocks with a spoken cue, not silence.
+
+        Previously code blocks collapsed to a bare space, so the listener heard
+        an unexplained gap. They should now hear a short cue pointing them to the
+        screen. See the 'audible code-block cue' change.
+        """
+        src = _read('ui.js')
+        # The fenced-code replacement target must contain the spoken cue text.
+        assert 'code block' in src and 'see screen' in src, \
+            "_stripForTTS must emit an audible '(code block — see screen)' cue"
+        # Guard against regressing to the silent ' ' replacement on the fenced regex.
+        m = re.search(r"text=text\.replace\(/\(\^\|\\n\).*?```.*?/g,\s*'([^']*)'\)", src)
+        assert m, "fenced code-block replace() line not found in _stripForTTS"
+        assert m.group(1).strip() not in ('', '.'), \
+            "fenced code block must not collapse to silent whitespace — use the cue"
+
     def test_strip_media_paths(self):
         """_stripForTTS must replace MEDIA: paths."""
         src = _read('ui.js')
@@ -170,6 +187,67 @@ class TestTtsAutoRead:
             "speechSynthesis.pause not called in messages.js"
         assert 'speechSynthesis.resume' in src, \
             "speechSynthesis.resume not called in messages.js"
+
+
+class TestTtsChatterboxVoice:
+    """Selectable Chatterbox voice plumbing: client -> /api/tts -> Chatterbox.
+
+    The /api/tts proxy lives as JS embedded in api/routes.py plus the Python
+    handler _handle_tts_proxy; the client helpers live in the same embedded JS.
+    """
+
+    @staticmethod
+    def _routes():
+        path = os.path.join(os.path.dirname(__file__), '..', 'api', 'routes.py')
+        return open(path, encoding='utf-8').read()
+
+    def test_proxy_reads_voice_from_body(self):
+        """_handle_tts_proxy must take voice from the request body, not hardcode alloy."""
+        src = self._routes()
+        assert 'body.get("voice")' in src, \
+            "TTS proxy must read 'voice' from the request body"
+
+    def test_proxy_has_env_default_voice(self):
+        """Voice default must be env-configurable (VOICE_TOOLS_TTS_VOICE)."""
+        src = self._routes()
+        assert 'VOICE_TOOLS_TTS_VOICE' in src, \
+            "TTS proxy must support a VOICE_TOOLS_TTS_VOICE env default"
+
+    def test_proxy_sanitizes_voice(self):
+        """Voice value must be charset-sanitized before being forwarded."""
+        src = self._routes()
+        assert 're.fullmatch' in src and 'A-Za-z0-9' in src, \
+            "TTS proxy must sanitize the voice value against an allowlist charset"
+
+    def test_proxy_no_longer_hardcodes_alloy_in_payload(self):
+        """The synthesized payload must use the resolved voice variable, not a literal."""
+        src = self._routes()
+        # The payload line should reference the `voice` variable, not "voice": "alloy".
+        assert re.search(r'"voice":\s*voice', src), \
+            "TTS proxy payload must send the resolved `voice` variable"
+
+    def test_client_voice_helper_exists(self):
+        """A _hermesTTSVoice() helper must resolve the selected Chatterbox voice."""
+        src = self._routes()
+        assert 'window._hermesTTSVoice' in src, \
+            "_hermesTTSVoice helper missing from embedded TTS JS"
+
+    def test_client_voice_uses_distinct_key(self):
+        """Chatterbox voice must use its own localStorage key, not the browser-voice key.
+
+        'hermes-tts-voice' holds a browser SpeechSynthesis voice name (native
+        fallback). Sending that to Chatterbox is meaningless, so the server-TTS
+        voice must live under a separate key.
+        """
+        src = self._routes()
+        assert 'hermes-tts-chatterbox-voice' in src, \
+            "Chatterbox voice must use the dedicated 'hermes-tts-chatterbox-voice' key"
+
+    def test_client_synth_passes_voice(self):
+        """_synth must forward opts.voice in the /api/tts request body."""
+        src = self._routes()
+        assert 'reqBody.voice' in src, \
+            "_synth must include the selected voice in the /api/tts body"
 
 
 class TestTtsBoot:

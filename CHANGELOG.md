@@ -3,6 +3,14 @@
 
 ## [Unreleased]
 
+### Added
+
+- **Selectable Chatterbox voice** — the `/api/tts` proxy now accepts an optional `voice` (and `model`) in the request body, with an env-configurable default (`VOICE_TOOLS_TTS_VOICE`, falling back to `alloy` for back-compat). The browser passes a saved voice through every server-TTS path (auto-read, voice mode, read-aloud) via a new `window._hermesTTSVoice()` helper backed by the dedicated `hermes-tts-chatterbox-voice` localStorage key — kept separate from `hermes-tts-voice` (which holds a browser SpeechSynthesis voice name for the native fallback). The voice value is charset-sanitized (`[A-Za-z0-9 _.-]`, ≤64 chars) server-side before being forwarded to Chatterbox; unknown names fall back to Chatterbox's built-in voice. Lets users select a registered reference-clip voice from `VOICES_DIR` instead of always getting the default. (`api/routes.py`, `tests/test_499_tts_playback.py`)
+
+### Changed
+
+- **Audible code-block cue in TTS** — `_stripForTTS` no longer collapses fenced code blocks to silent whitespace; it now emits a short spoken cue (`(code block — see screen)`) so listeners know a block was skipped instead of hearing an unexplained gap. The screen still carries the full code. The boot.js fallback stripper uses the same wording. (`static/ui.js`, `static/boot.js`, `tests/test_499_tts_playback.py`)
+
 ## [v0.51.171] — 2026-05-30 — Release EQ (stage-batch53 — tool-output card badge + Neon opt-in skin)
 
 ### Added

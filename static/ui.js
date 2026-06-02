@@ -4234,9 +4234,12 @@ function _copyThinkingText(btn){
 // ── TTS: Text-to-Speech via Web Speech API (#499) ──
 // Strips markdown, code blocks, and MEDIA: paths for clean speech output.
 function _stripForTTS(text){
-  // Remove code blocks entirely (```) — line-anchored to match #1438 fix
-  text=text.replace(/(^|\n)[ ]{0,3}```(?:[\s\S]*?\n)?[ ]{0,3}```(?=\n|$)/g,' ');
-  // Remove inline code
+  // Fenced code blocks aren't read aloud (reading code char-by-char is noise),
+  // but emit a short spoken cue so the listener knows something was skipped and
+  // to look at the screen — rather than hearing an unexplained gap. Line-anchored
+  // to match #1438 fix. Leading punctuation/period keeps prosody clean mid-sentence.
+  text=text.replace(/(^|\n)[ ]{0,3}```(?:[\s\S]*?\n)?[ ]{0,3}```(?=\n|$)/g,'. (code block — see screen.) ');
+  // Remove inline code (short tokens; a brief gap reads fine, no cue needed)
   text=text.replace(/`[^`]+`/g,' ');
   // Strip bold/italic
   text=text.replace(/\*\*(.+?)\*\*/g,'$1');
