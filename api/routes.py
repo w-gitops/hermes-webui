@@ -6048,11 +6048,18 @@ _HERMES_TTS_JS = r"""<script>(function(){
       var el = document.createElement("audio");
       el.setAttribute("playsinline", "");
       el.loop = true;
+      el.style.display = "none";
       el.src = _silentWavURL();
+      // iOS WebKit requires the element to be in the DOM before play() will succeed.
+      document.body.appendChild(el);
       var p = el.play();
       if (p && p.then){
         p.then(function(){ _diag("tts_media_session", "playback category engaged (silent-switch immune)"); })
-         .catch(function(e){ _silentEl = null; _diag("tts_media_session_failed", (e && e.message) || String(e)); });
+         .catch(function(e){
+           _silentEl = null;
+           try{ document.body.removeChild(el); }catch(_){}
+           _diag("tts_media_session_failed", (e && e.message) || String(e));
+         });
       }
       _silentEl = el;
     }catch(e){ _silentEl = null; }
