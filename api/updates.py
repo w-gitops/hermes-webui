@@ -166,9 +166,13 @@ def _run_git(args, cwd, timeout=10):
         r = subprocess.run(
             ['git'] + args, cwd=str(cwd), capture_output=True,
             text=True, timeout=timeout,
+            encoding='utf-8', errors='replace',
         )
-        stdout = r.stdout.strip()
-        stderr = r.stderr.strip()
+        # On non-UTF-8 locales (e.g. Chinese Windows GBK), a binary git
+        # output that fails to decode used to leave r.stdout = None and crash
+        # the whole import with AttributeError. Guard against None defensively.
+        stdout = (r.stdout or '').strip()
+        stderr = (r.stderr or '').strip()
         if r.returncode == 0:
             return stdout, True
         return stderr or stdout or f"git exited with status {r.returncode}", False
@@ -195,6 +199,10 @@ def _dirty_suffix(path: Path, timeout=1) -> str:
     # the dirty signal; real errors (timeouts, missing git) carry a different
     # diagnostic and correctly suppress the suffix.
     if not out or out.startswith('git exited with status '):
+        diff, diff_ok = _run_git(['diff', '--binary', 'HEAD', '--'], path, timeout=timeout)
+        if diff_ok and diff:
+            digest = hashlib.sha1(diff.encode('utf-8', errors='replace')).hexdigest()[:8]
+            return f"-dirty-{digest}"
         return "-dirty"
     return ""
 
@@ -458,6 +466,14 @@ def _head_contains_ref(path, ref):
     return bool(ok)
 
 
+def _can_fast_forward_to(path, ref):
+    """Return True when ``ref`` is a descendant of HEAD (``git pull --ff-only`` can reach it)."""
+    if not ref:
+        return False
+    _, ok = _run_git(['merge-base', '--is-ancestor', 'HEAD', ref], path)
+    return bool(ok)
+
+
 def _select_apply_compare_ref(path):
     """Return the same remote ref family that the update check reports.
 
@@ -489,6 +505,8 @@ def _select_apply_compare_ref(path):
             behind == 0 and _head_is_past_latest_tag(path, current_tag)
         ) or (
             behind > 0 and _head_contains_ref(path, latest_tag)
+        ) or (
+            behind > 0 and not _can_fast_forward_to(path, latest_tag)
         ):
             pass
         else:
@@ -527,6 +545,12 @@ def _check_repo_release(path, name):
     # Fall through to the branch check so the banner compares against the
     # configured upstream instead of advertising a tag that cannot fast-forward.
     if behind > 0 and _head_contains_ref(path, latest_tag):
+        return None
+
+    # Patch releases can land on a side branch while day-to-day installs track
+    # main past an older tag. A positive tag-name gap then advertises an update
+    # that `git pull --ff-only <latest-tag>` cannot reach.
+    if behind > 0 and not _can_fast_forward_to(path, latest_tag):
         return None
 
     remote_url, _ = _run_git(['remote', 'get-url', 'origin'], path)
@@ -1025,10 +1049,37 @@ def _schedule_restart(delay: float = 2.0) -> None:
         with _apply_lock:
             _wait_until_restart_safe()
             try:
-                os.execv(sys.executable, [sys.executable] + sys.argv)
+                # Re-exec into the just-pulled image.
+                #
+                # sys.argv[0]'s meaning depends on how the server was launched:
+                #
+                #   * Source checkout (`python server.py` via bootstrap.py /
+                #     ctl.sh / start.sh): sys.argv[0] is the SCRIPT path
+                #     (e.g. "/root/hermes-webui/server.py"), sys.executable is
+                #     the interpreter. CPython treats argv[1] as the script to
+                #     run, so we must pass [sys.executable] + sys.argv.
+                #
+                #   * Frozen/packaged build (PyInstaller, embedded zipapp,
+                #     etc.): sys.argv[0] == sys.executable == <binary>. Passing
+                #     [sys.executable] + sys.argv would re-insert the binary as
+                #     argv[1] — the kernel launches it, the interpreter treats
+                #     the binary itself as the "script" to run, and execv
+                #     effectively becomes a recursive no-op that never reaches
+                #     bind(), leaving the WebUI stuck "offline" after every
+                #     self-update. Pass argv as-is instead.
+                #
+                # Distinguish the two cases with sys.frozen (set by
+                # PyInstaller / zipapp / similar). For source checkouts the
+                # `[sys.executable] + sys.argv` form is the canonical CPython
+                # re-exec idiom (same shape Flask/Django reloaders use) and
+                # is the correct path.
+                if getattr(sys, "frozen", False):
+                    os.execv(sys.executable, sys.argv)
+                else:
+                    os.execv(sys.executable, [sys.executable] + sys.argv)
             except Exception:
-                # Last-resort: if execv fails (e.g. frozen binary), just exit
-                # so the process supervisor (start.sh / Docker) restarts us.
+                # Last-resort: if execv fails for any reason, just exit so the
+                # process supervisor (start.sh / Docker) restarts us.
                 os._exit(0)
 
     threading.Thread(target=_do, daemon=True).start()
