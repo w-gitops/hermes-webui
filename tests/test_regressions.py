@@ -1044,9 +1044,14 @@ def test_messages_js_live_assistant_segment_reuses_live_turn_wrapper(cleanup_tes
     assert token_start >= 0 and interim_start > token_start
     token_body = src[token_start:interim_start]
     compact_token_body = token_body.replace(" ", "").replace("\n", "")
-    assert "if(assistantRow){ensureAssistantRow();_scheduleRender();}" in compact_token_body, \
-        "token handler should skip the per-token full-text parse after the live answer segment exists"
-    assert "constparsed=_parseStreamState();if(String((parsed&&parsed.displayText)||'').trim())ensureAssistantRow();_scheduleRender(parsed);" in compact_token_body, \
+    # Fork (#499): TTS auto-read speaks complete sentences mid-generation and needs the
+    # live parsed text, so the parse-skip fast path is additionally gated on a cheap
+    # _hermesAutoRead.wants() probe — the parse is still skipped whenever auto-read
+    # will not consume it, which preserves the #5455 WS2.3 property this test guards.
+    assert "if(assistantRow&&!_arWants){ensureAssistantRow();_scheduleRender();}" in compact_token_body, \
+        "token handler should skip the per-token full-text parse after the live answer segment exists (unless TTS auto-read needs it)"
+    assert "constparsed=_parseStreamState();" in compact_token_body and \
+        "if(assistantRow||String((parsed&&parsed.displayText)||'').trim())ensureAssistantRow();_scheduleRender(parsed);" in compact_token_body, \
         "token handler must only create the live answer segment once visible answer text starts"
 
 
