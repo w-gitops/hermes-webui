@@ -556,6 +556,16 @@ def main() -> None:
 
     print_startup_config()
 
+    try:
+        from api.org_policy import ensure_startup
+
+        ensure_startup()
+    except Exception as exc:
+        if (os.environ.get("HERMES_ORG_POLICY_MODE") or "").strip() == "policy_required":
+            print(f"[!!] FATAL: org policy startup failed: {exc}", flush=True)
+            sys.exit(1)
+        print(f"[!!] WARNING: org policy startup skipped: {exc}", flush=True)
+
     fd_limit = _raise_fd_soft_limit()
     if fd_limit.get("status") == "raised":
         print(
