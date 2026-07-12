@@ -10975,6 +10975,13 @@ def _project_os_onboarding_context(repo_root: Path, project_md: dict | None, pla
 def _handle_project_os_dashboard(handler, parsed) -> bool:
     qs = parse_qs(parsed.query or "")
     requested_board = str((qs.get("board") or [""])[0] or "").strip()
+    if requested_board:
+        try:
+            from api.org_policy import OrgPolicyDeny, authorize_project_os_board
+
+            authorize_project_os_board(requested_board)
+        except OrgPolicyDeny as exc:
+            return bad(handler, str(exc), status=exc.status)
     workspace_raw = str(get_last_workspace() or "").strip()
     repo_root = Path(workspace_raw).expanduser() if workspace_raw else None
     selected_board_meta = None

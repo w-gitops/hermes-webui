@@ -21,6 +21,12 @@ from urllib.parse import parse_qs, unquote
 
 from api.helpers import bad, j
 
+try:
+    from api.org_policy import OrgPolicyDeny
+except ImportError:  # pragma: no cover
+    class OrgPolicyDeny(Exception):  # type: ignore[no-redef]
+        status = 403
+
 BOARD_COLUMNS = ["triage", "todo", "ready", "running", "blocked", "done"]
 _TASK_PREFIX = "/api/kanban/tasks/"
 
@@ -54,6 +60,21 @@ def _resolve_board_from_body(body):
     if raw is None or (isinstance(raw, str) and raw.strip() == ""):
         return None
     return _normalise_board_or_raise(raw)
+
+
+def _resolve_board_authorized(parsed=None, body=None):
+    """Resolve board slug from query/body and enforce org policy when active."""
+    from api.org_policy import OrgPolicyDeny, authorize_board
+
+    board_q = _resolve_board(parsed) if parsed is not None else None
+    board_b = _resolve_board_from_body(body) if body is not None else None
+    if board_q is not None and board_b is not None and board_q != board_b:
+        raise ValueError("conflicting board selectors")
+    raw = board_q if board_q is not None else board_b
+    try:
+        return _normalise_board_or_raise(authorize_board(requested_board=raw))
+    except OrgPolicyDeny:
+        raise
 
 
 def _normalise_board_or_raise(raw):
@@ -192,7 +213,7 @@ def _comment_counts(conn):
 
 def _board_payload(parsed):
     """Build the full board JSON payload: kanban columns with tasks, filter state, and latest_event_id."""
-    board = _resolve_board(parsed)
+    board = _resolve_board_authorized(parsed)
     kb = _kb()
     tenant = _str_query(parsed, "tenant")
     assignee = _str_query(parsed, "assignee")
@@ -333,6 +354,8 @@ def _set_status_direct(conn, task_id: str, new_status: str) -> bool:
 
 def _create_task_payload(body: dict, *, board=None):
     """Create a new task from a parsed request body and return the task dict in a read_only envelope."""
+    from api.org_policy import OrgPolicyDeny, admit_task_create
+
     title = str(body.get("title") or "").strip()
     if not title:
         raise ValueError("title is required")
@@ -340,6 +363,10 @@ def _create_task_payload(body: dict, *, board=None):
         priority = int(body.get("priority") or 0)
     except (TypeError, ValueError):
         raise ValueError("priority must be an integer")
+    try:
+        body = admit_task_create(body, board=board)
+    except OrgPolicyDeny as exc:
+        raise PermissionError(str(exc)) from exc
     kb = _kb()
     requested_status = body.get("status")
     with _conn(board=board) as conn:
@@ -527,7 +554,7 @@ def _task_detail_payload(task_id: str, *, board=None):
 
 def _events_payload(parsed):
     """Return paginated task events from the board's event log, starting after the ?since= cursor."""
-    board = _resolve_board(parsed)
+    board = _resolve_board_authorized(parsed)
     since = _int_query(parsed, "since", 0, minimum=0)
     limit = _int_query(parsed, "limit", 200, minimum=1, maximum=200)
     with _conn(board=board) as conn:
@@ -651,7 +678,7 @@ def _assignees_payload(*, board=None):
 
 def _task_log_payload(parsed, task_id: str):
     """Return the raw worker log content and on-disk metadata for a task's dispatcher run."""
-    board = _resolve_board(parsed)
+    board = _resolve_board_authorized(parsed)
     kb = _kb()
     tail = _int_query(parsed, "tail", None, minimum=1, maximum=2_000_000)
     with _conn(board=board) as conn:
@@ -715,7 +742,7 @@ def _bulk_tasks_payload(body: dict, *, board=None):
 
 def _dispatch_payload(parsed):
     """Trigger a single-pass kanban dispatcher run and return the dispatch result."""
-    board = _resolve_board(parsed)
+    board = _resolve_board_authorized(parsed)
     kb = _kb()
     dry_run = _bool_query(parsed, "dry_run", False)
     max_spawn = _int_query(parsed, "max", 8, minimum=1, maximum=100)
@@ -839,6 +866,14 @@ def _list_boards_payload(parsed):
         meta["counts"] = _board_counts_for_slug(slug)
         meta["total"] = sum(meta["counts"].values()) if meta["counts"] else 0
         out.append(meta)
+    try:
+        from api.org_policy import filter_board_slugs
+
+        slugs = [m.get("slug") for m in out if m.get("slug")]
+        allowed = set(filter_board_slugs([str(s) for s in slugs]))
+        out = [m for m in out if m.get("slug") in allowed]
+    except Exception:
+        pass
     return {"boards": out, "current": current, "read_only": False}
 
 
@@ -1068,7 +1103,7 @@ def _handle_events_sse_stream(handler, parsed):
     transport swapped.
     """
     try:
-        board = _resolve_board(parsed)
+        board = _resolve_board_authorized(parsed)
     except (ValueError, LookupError) as exc:
         return bad(handler, str(exc), status=400 if isinstance(exc, ValueError) else 404)
 
@@ -1168,11 +1203,11 @@ def handle_kanban_get(handler, parsed) -> bool | None:
         if path == "/api/kanban/board":
             return j(handler, _board_payload(parsed)) or True
         if path == "/api/kanban/config":
-            return j(handler, _config_payload(board=_resolve_board(parsed))) or True
+            return j(handler, _config_payload(board=_resolve_board_authorized(parsed))) or True
         if path == "/api/kanban/stats":
-            return j(handler, _stats_payload(board=_resolve_board(parsed))) or True
+            return j(handler, _stats_payload(board=_resolve_board_authorized(parsed))) or True
         if path == "/api/kanban/assignees":
-            return j(handler, _assignees_payload(board=_resolve_board(parsed))) or True
+            return j(handler, _assignees_payload(board=_resolve_board_authorized(parsed))) or True
         if path == "/api/kanban/events":
             return j(handler, _events_payload(parsed)) or True
         if path == "/api/kanban/events/stream":
@@ -1189,7 +1224,7 @@ def handle_kanban_get(handler, parsed) -> bool | None:
             task_id = unquote(path[len(_TASK_PREFIX):]).strip("/")
             if not task_id or "/" in task_id:
                 return False
-            payload = _task_detail_payload(task_id, board=_resolve_board(parsed))
+            payload = _task_detail_payload(task_id, board=_resolve_board_authorized(parsed))
             if payload is None:
                 return bad(handler, "task not found", status=404)
             return j(handler, payload) or True
@@ -1201,6 +1236,10 @@ def handle_kanban_get(handler, parsed) -> bool | None:
         return bad(handler, f"kanban unavailable: {exc}", status=503)
     except LookupError as exc:
         return bad(handler, str(exc), status=404)
+    except PermissionError as exc:
+        return bad(handler, str(exc), status=403)
+    except OrgPolicyDeny as exc:
+        return bad(handler, str(exc), status=getattr(exc, "status", 403))
     except ValueError as exc:
         return bad(handler, str(exc))
     except RuntimeError as exc:
@@ -1226,9 +1265,7 @@ def handle_kanban_post(handler, parsed, body) -> bool | None:
             return j(handler, _switch_board_payload(slug)) or True
         # All board-scoped writes accept a ?board=<slug> query param OR a
         # `board` field in the JSON body. Query takes precedence.
-        board_q = _resolve_board(parsed)
-        board_b = _resolve_board_from_body(body)
-        board = board_q if board_q is not None else board_b
+        board = _resolve_board_authorized(parsed, body)
         if path == "/api/kanban/dispatch":
             return j(handler, _dispatch_payload(parsed)) or True
         if path == "/api/kanban/tasks/bulk":
@@ -1253,6 +1290,10 @@ def handle_kanban_post(handler, parsed, body) -> bool | None:
         return bad(handler, f"kanban unavailable: {exc}", status=503)
     except LookupError as exc:
         return bad(handler, str(exc), status=404)
+    except PermissionError as exc:
+        return bad(handler, str(exc), status=403)
+    except OrgPolicyDeny as exc:
+        return bad(handler, str(exc), status=getattr(exc, "status", 403))
     except ValueError as exc:
         return bad(handler, str(exc))
     except RuntimeError as exc:
@@ -1293,6 +1334,10 @@ def handle_kanban_patch(handler, parsed, body) -> bool | None:
         return bad(handler, f"kanban unavailable: {exc}", status=503)
     except LookupError as exc:
         return bad(handler, str(exc), status=404)
+    except PermissionError as exc:
+        return bad(handler, str(exc), status=403)
+    except OrgPolicyDeny as exc:
+        return bad(handler, str(exc), status=getattr(exc, "status", 403))
     except ValueError as exc:
         return bad(handler, str(exc))
     except RuntimeError as exc:
@@ -1322,6 +1367,10 @@ def handle_kanban_delete(handler, parsed, body) -> bool | None:
         return bad(handler, f"kanban unavailable: {exc}", status=503)
     except LookupError as exc:
         return bad(handler, str(exc), status=404)
+    except PermissionError as exc:
+        return bad(handler, str(exc), status=403)
+    except OrgPolicyDeny as exc:
+        return bad(handler, str(exc), status=getattr(exc, "status", 403))
     except ValueError as exc:
         return bad(handler, str(exc))
     except RuntimeError as exc:
